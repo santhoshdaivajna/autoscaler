@@ -17,7 +17,6 @@ limitations under the License.
 package aws
 
 import (
-	"errors"
 	"fmt"
 
 	"github.com/aws/aws-sdk-go/aws"
@@ -28,7 +27,9 @@ import (
 // autoScaling is the interface represents a specific aspect of the auto-scaling service provided by AWS SDK for use in CA
 type autoScaling interface {
 	DescribeAutoScalingGroups(input *autoscaling.DescribeAutoScalingGroupsInput) (*autoscaling.DescribeAutoScalingGroupsOutput, error)
-	DescribeTags(input *autoscaling.DescribeTagsInput) (*autoscaling.DescribeTagsOutput, error)
+	DescribeAutoScalingGroupsPages(input *autoscaling.DescribeAutoScalingGroupsInput, fn func(*autoscaling.DescribeAutoScalingGroupsOutput, bool) bool) error
+	DescribeLaunchConfigurations(*autoscaling.DescribeLaunchConfigurationsInput) (*autoscaling.DescribeLaunchConfigurationsOutput, error)
+	DescribeTagsPages(input *autoscaling.DescribeTagsInput, fn func(*autoscaling.DescribeTagsOutput, bool) bool) error
 	SetDesiredCapacity(input *autoscaling.SetDesiredCapacityInput) (*autoscaling.SetDesiredCapacityOutput, error)
 	TerminateInstanceInAutoScalingGroup(input *autoscaling.TerminateInstanceInAutoScalingGroupInput) (*autoscaling.TerminateInstanceInAutoScalingGroupOutput, error)
 }
@@ -36,6 +37,23 @@ type autoScaling interface {
 // autoScalingWrapper provides several utility methods over the auto-scaling service provided by AWS SDK
 type autoScalingWrapper struct {
 	autoScaling
+}
+
+func (m autoScalingWrapper) getInstanceTypeByLCName(name string) (string, error) {
+	params := &autoscaling.DescribeLaunchConfigurationsInput{
+		LaunchConfigurationNames: []*string{aws.String(name)},
+		MaxRecords:               aws.Int64(1),
+	}
+	launchConfigurations, err := m.DescribeLaunchConfigurations(params)
+	if err != nil {
+		glog.V(4).Infof("Failed LaunchConfiguration info request for %s: %v", name, err)
+		return "", err
+	}
+	if len(launchConfigurations.LaunchConfigurations) < 1 {
+		return "", fmt.Errorf("Unable to get first LaunchConfiguration for %s", name)
+	}
+
+	return *launchConfigurations.LaunchConfigurations[0].InstanceType, nil
 }
 
 func (m autoScalingWrapper) getAutoscalingGroupByName(name string) (*autoscaling.Group, error) {
@@ -55,50 +73,29 @@ func (m autoScalingWrapper) getAutoscalingGroupByName(name string) (*autoscaling
 }
 
 func (m *autoScalingWrapper) getAutoscalingGroupsByNames(names []string) ([]*autoscaling.Group, error) {
-	glog.V(6).Infof("Starting getAutoscalingGroupsByNames with names=%v", names)
-
-	nameRefs := []*string{}
-	for _, n := range names {
-		nameRefs = append(nameRefs, aws.String(n))
+	if len(names) == 0 {
+		return nil, nil
 	}
-	params := &autoscaling.DescribeAutoScalingGroupsInput{
-		AutoScalingGroupNames: nameRefs,
+	input := &autoscaling.DescribeAutoScalingGroupsInput{
+		AutoScalingGroupNames: aws.StringSlice(names),
 		MaxRecords:            aws.Int64(maxRecordsReturnedByAPI),
 	}
-	description, err := m.DescribeAutoScalingGroups(params)
-	if err != nil {
-		glog.V(4).Infof("Failed to describe ASGs : %v", err)
+	asgs := make([]*autoscaling.Group, 0)
+	if err := m.DescribeAutoScalingGroupsPages(input, func(output *autoscaling.DescribeAutoScalingGroupsOutput, _ bool) bool {
+		asgs = append(asgs, output.AutoScalingGroups...)
+		// We return true while we want to be called with the next page of
+		// results, if any.
+		return true
+	}); err != nil {
 		return nil, err
 	}
-	if len(description.AutoScalingGroups) < 1 {
-		return nil, errors.New("No ASGs found")
-	}
-
-	asgs := description.AutoScalingGroups
-	for description.NextToken != nil {
-		description, err = m.DescribeAutoScalingGroups(&autoscaling.DescribeAutoScalingGroupsInput{
-			NextToken:  description.NextToken,
-			MaxRecords: aws.Int64(maxRecordsReturnedByAPI),
-		})
-		if err != nil {
-			glog.V(4).Infof("Failed to describe ASGs : %v", err)
-			return nil, err
-		}
-		asgs = append(asgs, description.AutoScalingGroups...)
-	}
-
-	glog.V(6).Infof("Finishing getAutoscalingGroupsByNames asgs=%v", asgs)
-
 	return asgs, nil
 }
 
 func (m *autoScalingWrapper) getAutoscalingGroupsByTags(keys []string) ([]*autoscaling.Group, error) {
-	glog.V(6).Infof("Starting getAutoscalingGroupsByTag with keys=%v", keys)
-
-	numKeys := len(keys)
-
-	// DescribeTags does an OR query when multiple filters on different tags are specified.
-	// In other words, DescribeTags returns [asg1, asg1] for keys [t1, t2] when there's only one asg tagged both t1 and t2.
+	// DescribeTags does an OR query when multiple filters on different tags are
+	// specified. In other words, DescribeTags returns [asg1, asg1] for keys
+	// [t1, t2] when there's only one asg tagged both t1 and t2.
 	filters := []*autoscaling.Filter{}
 	for _, key := range keys {
 		filter := &autoscaling.Filter{
@@ -107,58 +104,35 @@ func (m *autoScalingWrapper) getAutoscalingGroupsByTags(keys []string) ([]*autos
 		}
 		filters = append(filters, filter)
 	}
-	description, err := m.DescribeTags(&autoscaling.DescribeTagsInput{
+
+	tags := []*autoscaling.TagDescription{}
+	input := &autoscaling.DescribeTagsInput{
 		Filters:    filters,
 		MaxRecords: aws.Int64(maxRecordsReturnedByAPI),
-	})
-	if err != nil {
-		glog.V(4).Infof("Failed to describe ASG tags for keys %v : %v", keys, err)
+	}
+	if err := m.DescribeTagsPages(input, func(out *autoscaling.DescribeTagsOutput, _ bool) bool {
+		tags = append(tags, out.Tags...)
+		// We return true while we want to be called with the next page of
+		// results, if any.
+		return true
+	}); err != nil {
 		return nil, err
 	}
-	if len(description.Tags) < 1 {
-		return nil, fmt.Errorf("Unable to find ASGs for tag keys %v", keys)
-	}
-	tags := []*autoscaling.TagDescription{}
-	tags = append(tags, description.Tags...)
 
-	for description.NextToken != nil {
-		description, err = m.DescribeTags(&autoscaling.DescribeTagsInput{
-			NextToken:  description.NextToken,
-			MaxRecords: aws.Int64(maxRecordsReturnedByAPI),
-		})
-		if err != nil {
-			glog.V(4).Infof("Failed to describe ASG tags for key %v: %v", keys, err)
-			return nil, err
-		}
-		tags = append(tags, description.Tags...)
-	}
-
-	// De-duplicate asg names
-	asgNameOccurrences := map[string]int{}
-	for _, t := range tags {
-		asgName := *(t.ResourceId)
-		if n, ok := asgNameOccurrences[asgName]; ok {
-			asgNameOccurrences[asgName] = n + 1
-		} else {
-			asgNameOccurrences[asgName] = 1
-		}
-	}
-	// Accordingly to how DescribeTags API works, the result contains ASGs which not all but only subset of tags are associated.
-	// Explicitly select ASGs to which all the tags are associated so that we won't end up calling DescribeAutoScalingGroups API
-	// multiple times on an ASG
+	// According to how DescribeTags API works, the result contains ASGs which
+	// not all but only subset of tags are associated. Explicitly select ASGs to
+	// which all the tags are associated so that we won't end up calling
+	// DescribeAutoScalingGroups API multiple times on an ASG.
 	asgNames := []string{}
-	for asgName, n := range asgNameOccurrences {
-		if n == numKeys {
+	asgNameOccurrences := make(map[string]int)
+	for _, t := range tags {
+		asgName := aws.StringValue(t.ResourceId)
+		occurrences := asgNameOccurrences[asgName] + 1
+		if occurrences >= len(keys) {
 			asgNames = append(asgNames, asgName)
 		}
+		asgNameOccurrences[asgName] = occurrences
 	}
 
-	asgs, err := m.getAutoscalingGroupsByNames(asgNames)
-	if err != nil {
-		return nil, err
-	}
-
-	glog.V(6).Infof("Finishing getAutoscalingGroupsByTag with asgs=%v", asgs)
-
-	return asgs, nil
+	return m.getAutoscalingGroupsByNames(asgNames)
 }

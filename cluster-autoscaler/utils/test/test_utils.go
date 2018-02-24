@@ -20,13 +20,19 @@ import (
 	"fmt"
 	"time"
 
+	"net/http"
+	"net/http/httptest"
+
 	apiv1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/kubernetes/pkg/api"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes/scheme"
+	refv1 "k8s.io/client-go/tools/reference"
 	"k8s.io/kubernetes/pkg/api/testapi"
-	refv1 "k8s.io/kubernetes/pkg/api/v1/ref"
+
+	"github.com/stretchr/testify/mock"
 )
 
 // BuildTestPod creates a pod with specified resources.
@@ -65,6 +71,9 @@ func BuildTestNode(name string, millicpu int64, mem int64) *apiv1.Node {
 			Name:     name,
 			SelfLink: fmt.Sprintf("/api/v1/nodes/%s", name),
 			Labels:   map[string]string{},
+		},
+		Spec: apiv1.NodeSpec{
+			ProviderID: name,
 		},
 		Status: apiv1.NodeStatus{
 			Capacity: apiv1.ResourceList{
@@ -116,7 +125,7 @@ func SetNodeReadyState(node *apiv1.Node, ready bool, lastTransition time.Time) {
 
 // RefJSON builds string reference to
 func RefJSON(o runtime.Object) string {
-	ref, err := refv1.GetReference(api.Scheme, o)
+	ref, err := refv1.GetReference(scheme.Scheme, o)
 	if err != nil {
 		panic(err)
 	}
@@ -126,9 +135,60 @@ func RefJSON(o runtime.Object) string {
 	return string(json)
 }
 
-// GetReplicaSetAnnotation returns a map containing annotation simulating pod being created by ReplicaSet
-func GetReplicaSetAnnotation() map[string]string {
-	return map[string]string{
-		"kubernetes.io/created-by": "{\"kind\":\"SerializedReference\",\"apiVersion\":\"v1\",\"reference\":{\"kind\":\"ReplicaSet\"}}",
+// GenerateOwnerReferences builds OwnerReferences with a single reference
+func GenerateOwnerReferences(name, kind, api string, uid types.UID) []metav1.OwnerReference {
+	return []metav1.OwnerReference{
+		{
+			APIVersion:         api,
+			Kind:               kind,
+			Name:               name,
+			BlockOwnerDeletion: boolptr(true),
+			Controller:         boolptr(true),
+			UID:                uid,
+		},
 	}
+}
+
+func boolptr(val bool) *bool {
+	b := val
+	return &b
+}
+
+// HttpServerMock mocks server HTTP.
+//
+// Example:
+// // Create HttpServerMock.
+// server := NewHttpServerMock()
+// defer server.Close()
+// // Use server.URL to point your code to HttpServerMock.
+// g := newTestGceManager(t, server.URL, ModeGKE)
+// // Declare handled urls and results for them.
+// server.On("handle", "/project1/zones/us-central1-b/listManagedInstances").Return("<managedInstances>").Once()
+// // Call http server in your code.
+// instances, err := g.GetManagedInstances()
+// // Check if expected calls were executed.
+// 	mock.AssertExpectationsForObjects(t, server)
+type HttpServerMock struct {
+	mock.Mock
+	*httptest.Server
+}
+
+// NewHttpServerMock creates new HttpServerMock.
+func NewHttpServerMock() *HttpServerMock {
+	httpServerMock := &HttpServerMock{}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/",
+		func(w http.ResponseWriter, req *http.Request) {
+			result := httpServerMock.handle(req.URL.Path)
+			w.Write([]byte(result))
+		})
+
+	server := httptest.NewServer(mux)
+	httpServerMock.Server = server
+	return httpServerMock
+}
+
+func (l *HttpServerMock) handle(url string) string {
+	args := l.Called(url)
+	return args.String(0)
 }

@@ -17,23 +17,34 @@ limitations under the License.
 package metrics
 
 import (
-	"reflect"
 	"time"
 
-	"k8s.io/autoscaler/cluster-autoscaler/clusterstate"
 	"k8s.io/autoscaler/cluster-autoscaler/utils/errors"
 
+	"github.com/golang/glog"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
 // NodeScaleDownReason describes reason for removing node
 type NodeScaleDownReason string
 
+// FailedScaleUpReason describes reason of failed scale-up
+type FailedScaleUpReason string
+
+// FunctionLabel is a name of Cluster Autoscaler operation for which
+// we measure duration
+type FunctionLabel string
+
+// NodeGroupType describes node group relation to CA
+type NodeGroupType string
+
 const (
-	caNamespace   = "cluster_autoscaler"
-	readyLabel    = "ready"
-	unreadyLabel  = "unready"
-	startingLabel = "notStarted"
+	caNamespace           = "cluster_autoscaler"
+	readyLabel            = "ready"
+	unreadyLabel          = "unready"
+	startingLabel         = "notStarted"
+	unregisteredLabel     = "unregistered"
+	longUnregisteredLabel = "longUnregistered"
 
 	// Underutilized node was removed because of low utilization
 	Underutilized NodeScaleDownReason = "underutilized"
@@ -41,6 +52,39 @@ const (
 	Empty NodeScaleDownReason = "empty"
 	// Unready node was removed
 	Unready NodeScaleDownReason = "unready"
+
+	// APIError caused scale-up to fail
+	APIError FailedScaleUpReason = "apiCallError"
+	// Timeout was encountered when trying to scale-up
+	Timeout FailedScaleUpReason = "timeout"
+
+	// autoscaledGroup is managed by CA
+	autoscaledGroup NodeGroupType = "autoscaled"
+	// autoprovisionedGroup have been created by CA (Node Autoprovisioning),
+	// is currently autoscaled and can be removed by CA if it's no longer needed
+	autoprovisionedGroup NodeGroupType = "autoprovisioned"
+
+	// LogLongDurationThreshold defines the duration after which long function
+	// duration will be logged (in addition to being counted in metric).
+	// This is meant to help find unexpectedly long function execution times for
+	// debugging purposes.
+	LogLongDurationThreshold = 5 * time.Second
+)
+
+// Names of Cluster Autoscaler operations
+const (
+	ScaleDown                  FunctionLabel = "scaleDown"
+	ScaleDownNodeDeletion      FunctionLabel = "scaleDown:nodeDeletion"
+	ScaleDownFindNodesToRemove FunctionLabel = "scaleDown:findNodesToRemove"
+	ScaleDownMiscOperations    FunctionLabel = "scaleDown:miscOperations"
+	ScaleUp                    FunctionLabel = "scaleUp"
+	FindUnneeded               FunctionLabel = "findUnneeded"
+	UpdateState                FunctionLabel = "updateClusterState"
+	FilterOutSchedulable       FunctionLabel = "filterOutSchedulable"
+	Main                       FunctionLabel = "main"
+	Poll                       FunctionLabel = "poll"
+	Reconfigure                FunctionLabel = "reconfigure"
+	Autoscaling                FunctionLabel = "autoscaling"
 )
 
 var (
@@ -59,6 +103,14 @@ var (
 			Name:      "nodes_count",
 			Help:      "Number of nodes in cluster.",
 		}, []string{"state"},
+	)
+
+	nodeGroupsCount = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: caNamespace,
+			Name:      "node_groups_count",
+			Help:      "Number of node groups managed by CA.",
+		}, []string{"node_group_type"},
 	)
 
 	unschedulablePodsCount = prometheus.NewGauge(
@@ -83,6 +135,7 @@ var (
 			Namespace: caNamespace,
 			Name:      "function_duration_seconds",
 			Help:      "Time taken by various parts of CA main loop.",
+			Buckets:   []float64{0.01, 0.05, 0.1, 0.5, 1.0, 2.5, 5.0, 7.5, 10.0, 12.5, 15.0, 17.5, 20.0, 22.5, 25.0, 27.5, 30.0, 50.0, 75.0, 100.0, 1000.0},
 		}, []string{"function"},
 	)
 
@@ -101,6 +154,14 @@ var (
 			Name:      "scaled_up_nodes_total",
 			Help:      "Number of nodes added by CA.",
 		},
+	)
+
+	failedScaleUpCount = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: caNamespace,
+			Name:      "failed_scale_ups_total",
+			Help:      "Number of times scale-up operation has failed.",
+		}, []string{"reason"},
 	)
 
 	scaleDownCount = prometheus.NewCounterVec(
@@ -126,49 +187,96 @@ var (
 			Help:      "Number of nodes currently considered unneeded by CA.",
 		},
 	)
+
+	/**** Metrics related to NodeAutoprovisioning ****/
+	napEnabled = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Namespace: caNamespace,
+			Name:      "nap_enabled",
+			Help:      "Whether or not Node Autoprovisioning is enabled. 1 if it is, 0 otherwise.",
+		},
+	)
+
+	nodeGroupCreationCount = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Namespace: caNamespace,
+			Name:      "created_node_groups_total",
+			Help:      "Number of node groups created by Node Autoprovisioning.",
+		},
+	)
+
+	nodeGroupDeletionCount = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Namespace: caNamespace,
+			Name:      "deleted_node_groups_total",
+			Help:      "Number of node groups deleted by Node Autoprovisioning.",
+		},
+	)
 )
 
-func init() {
+// RegisterAll registers all metrics.
+func RegisterAll() {
 	prometheus.MustRegister(clusterSafeToAutoscale)
 	prometheus.MustRegister(nodesCount)
+	prometheus.MustRegister(nodeGroupsCount)
 	prometheus.MustRegister(unschedulablePodsCount)
 	prometheus.MustRegister(lastActivity)
 	prometheus.MustRegister(functionDuration)
 	prometheus.MustRegister(errorsCount)
 	prometheus.MustRegister(scaleUpCount)
+	prometheus.MustRegister(failedScaleUpCount)
 	prometheus.MustRegister(scaleDownCount)
 	prometheus.MustRegister(evictionsCount)
 	prometheus.MustRegister(unneededNodesCount)
+	prometheus.MustRegister(napEnabled)
+	prometheus.MustRegister(nodeGroupCreationCount)
+	prometheus.MustRegister(nodeGroupDeletionCount)
 }
 
-func getDuration(start time.Time) float64 {
-	return time.Now().Sub(start).Seconds()
+// UpdateDurationFromStart records the duration of the step identified by the
+// label using start time
+func UpdateDurationFromStart(label FunctionLabel, start time.Time) {
+	duration := time.Now().Sub(start)
+	UpdateDuration(label, duration)
 }
 
 // UpdateDuration records the duration of the step identified by the label
-func UpdateDuration(label string, start time.Time) {
-	functionDuration.WithLabelValues(label).Observe(getDuration(start))
+func UpdateDuration(label FunctionLabel, duration time.Duration) {
+	// TODO(maciekpytel): remove second condition if we manage to get
+	// asynchronous node drain
+	if duration > LogLongDurationThreshold && label != ScaleDown {
+		glog.V(4).Infof("Function %s took %v to complete", label, duration)
+	}
+	functionDuration.WithLabelValues(string(label)).Observe(duration.Seconds())
 }
 
 // UpdateLastTime records the time the step identified by the label was started
-func UpdateLastTime(label string, now time.Time) {
-	lastActivity.WithLabelValues(label).Set(float64(now.Unix()))
+func UpdateLastTime(label FunctionLabel, now time.Time) {
+	lastActivity.WithLabelValues(string(label)).Set(float64(now.Unix()))
 }
 
-// UpdateClusterState updates metrics related to cluster state
-func UpdateClusterState(csr *clusterstate.ClusterStateRegistry) {
-	if csr == nil || reflect.ValueOf(csr).IsNil() {
-		return
-	}
-	if csr.IsClusterHealthy() {
+// UpdateClusterSafeToAutoscale records if cluster is safe to autoscale
+func UpdateClusterSafeToAutoscale(safe bool) {
+	if safe {
 		clusterSafeToAutoscale.Set(1)
 	} else {
 		clusterSafeToAutoscale.Set(0)
 	}
-	readiness := csr.GetClusterReadiness()
-	nodesCount.WithLabelValues(readyLabel).Set(float64(readiness.Ready))
-	nodesCount.WithLabelValues(unreadyLabel).Set(float64(readiness.Unready + readiness.LongNotStarted))
-	nodesCount.WithLabelValues(startingLabel).Set(float64(readiness.NotStarted))
+}
+
+// UpdateNodesCount records the number of nodes in cluster
+func UpdateNodesCount(ready, unready, starting, longUnregistered, unregistered int) {
+	nodesCount.WithLabelValues(readyLabel).Set(float64(ready))
+	nodesCount.WithLabelValues(unreadyLabel).Set(float64(unready))
+	nodesCount.WithLabelValues(startingLabel).Set(float64(starting))
+	nodesCount.WithLabelValues(longUnregisteredLabel).Set(float64(longUnregistered))
+	nodesCount.WithLabelValues(unregisteredLabel).Set(float64(unregistered))
+}
+
+// UpdateNodeGroupsCount records the number of node groups managed by CA
+func UpdateNodeGroupsCount(autoscaled, autoprovisioned int) {
+	nodeGroupsCount.WithLabelValues(string(autoscaledGroup)).Set(float64(autoscaled))
+	nodeGroupsCount.WithLabelValues(string(autoprovisionedGroup)).Set(float64(autoprovisioned))
 }
 
 // UpdateUnschedulablePodsCount records number of currently unschedulable pods
@@ -187,6 +295,11 @@ func RegisterScaleUp(nodesCount int) {
 	scaleUpCount.Add(float64(nodesCount))
 }
 
+// RegisterFailedScaleUp records a failed scale-up operation
+func RegisterFailedScaleUp(reason FailedScaleUpReason) {
+	failedScaleUpCount.WithLabelValues(string(reason)).Inc()
+}
+
 // RegisterScaleDown records number of nodes removed by scale down
 func RegisterScaleDown(nodesCount int, reason NodeScaleDownReason) {
 	scaleDownCount.WithLabelValues(string(reason)).Add(float64(nodesCount))
@@ -200,4 +313,23 @@ func RegisterEvictions(podsCount int) {
 // UpdateUnneededNodesCount records number of currently unneeded nodes
 func UpdateUnneededNodesCount(nodesCount int) {
 	unneededNodesCount.Set(float64(nodesCount))
+}
+
+// UpdateNapEnabled records if NodeAutoprovisioning is enabled
+func UpdateNapEnabled(enabled bool) {
+	if enabled {
+		napEnabled.Set(1)
+	} else {
+		napEnabled.Set(0)
+	}
+}
+
+// RegisterNodeGroupCreation registers node group creation
+func RegisterNodeGroupCreation() {
+	nodeGroupCreationCount.Add(1.0)
+}
+
+// RegisterNodeGroupDeletion registers node group deletion
+func RegisterNodeGroupDeletion() {
+	nodeGroupDeletionCount.Add(1.0)
 }

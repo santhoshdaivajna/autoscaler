@@ -18,67 +18,84 @@ package gce
 
 import (
 	"fmt"
-	"math/rand"
 	"strings"
-
-	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider"
-	"k8s.io/autoscaler/cluster-autoscaler/config/dynamic"
-	"k8s.io/autoscaler/cluster-autoscaler/utils/errors"
+	"time"
 
 	apiv1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	kubetypes "k8s.io/kubernetes/pkg/kubelet/types"
+	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider"
+	"k8s.io/autoscaler/cluster-autoscaler/utils/errors"
+	"k8s.io/autoscaler/cluster-autoscaler/utils/gpu"
 	"k8s.io/kubernetes/plugin/pkg/scheduler/schedulercache"
 )
 
+// The 'GCE' cloud provider actually implements both the GCE and GKE providers.
 const (
-	// KubeProxyCpuRequestMillis is the amount of cpu requested by Kubeproxy
-	KubeProxyCpuRequestMillis = 100
+	ProviderNameGCE = "gce"
+	ProviderNameGKE = "gke"
 )
+
+const (
+	maxAutoprovisionedSize = 1000
+	minAutoprovisionedSize = 0
+)
+
+// Big machines are temporarily commented out.
+// TODO(mwielgus): get this list programatically
+var autoprovisionedMachineTypes = []string{
+	"n1-standard-1",
+	"n1-standard-2",
+	"n1-standard-4",
+	"n1-standard-8",
+	"n1-standard-16",
+	//"n1-standard-32",
+	//"n1-standard-64",
+	"n1-highcpu-2",
+	"n1-highcpu-4",
+	"n1-highcpu-8",
+	"n1-highcpu-16",
+	//"n1-highcpu-32",
+	// "n1-highcpu-64",
+	"n1-highmem-2",
+	"n1-highmem-4",
+	"n1-highmem-8",
+	"n1-highmem-16",
+	//"n1-highmem-32",
+	//"n1-highmem-64",
+}
 
 // GceCloudProvider implements CloudProvider interface.
 type GceCloudProvider struct {
-	gceManager *GceManager
-	migs       []*Mig
+	gceManager GceManager
+	// This resource limiter is used if resource limits are not defined through cloud API.
+	resourceLimiterFromFlags *cloudprovider.ResourceLimiter
 }
 
 // BuildGceCloudProvider builds CloudProvider implementation for GCE.
-func BuildGceCloudProvider(gceManager *GceManager, specs []string) (*GceCloudProvider, error) {
-	gce := &GceCloudProvider{
-		gceManager: gceManager,
-		migs:       make([]*Mig, 0),
-	}
-	for _, spec := range specs {
-		if err := gce.addNodeGroup(spec); err != nil {
-			return nil, err
-		}
-	}
-	return gce, nil
+func BuildGceCloudProvider(gceManager GceManager, resourceLimiter *cloudprovider.ResourceLimiter) (*GceCloudProvider, error) {
+	return &GceCloudProvider{gceManager: gceManager, resourceLimiterFromFlags: resourceLimiter}, nil
 }
 
-// addNodeGroup adds node group defined in string spec. Format:
-// minNodes:maxNodes:migUrl
-func (gce *GceCloudProvider) addNodeGroup(spec string) error {
-	mig, err := buildMig(spec, gce.gceManager)
-	if err != nil {
-		return err
-	}
-	gce.migs = append(gce.migs, mig)
-	gce.gceManager.RegisterMig(mig)
+// Cleanup cleans up all resources before the cloud provider is removed
+func (gce *GceCloudProvider) Cleanup() error {
+	gce.gceManager.Cleanup()
 	return nil
 }
 
 // Name returns name of the cloud provider.
 func (gce *GceCloudProvider) Name() string {
-	return "gce"
+	// Technically we're both ProviderNameGCE and ProviderNameGKE...
+	// Perhaps we should return a different name depending on
+	// gce.gceManager.getMode()?
+	return ProviderNameGCE
 }
 
 // NodeGroups returns all node groups configured for this cloud provider.
 func (gce *GceCloudProvider) NodeGroups() []cloudprovider.NodeGroup {
-	result := make([]cloudprovider.NodeGroup, 0, len(gce.migs))
-	for _, mig := range gce.migs {
-		result = append(result, mig)
+	migs := gce.gceManager.getMigs()
+	result := make([]cloudprovider.NodeGroup, 0, len(migs))
+	for _, mig := range migs {
+		result = append(result, mig.config)
 	}
 	return result
 }
@@ -96,6 +113,88 @@ func (gce *GceCloudProvider) NodeGroupForNode(node *apiv1.Node) (cloudprovider.N
 // Pricing returns pricing model for this cloud provider or error if not available.
 func (gce *GceCloudProvider) Pricing() (cloudprovider.PricingModel, errors.AutoscalerError) {
 	return &GcePriceModel{}, nil
+}
+
+// GetAvailableMachineTypes get all machine types that can be requested from the cloud provider.
+func (gce *GceCloudProvider) GetAvailableMachineTypes() ([]string, error) {
+	return autoprovisionedMachineTypes, nil
+}
+
+// NewNodeGroup builds a theoretical node group based on the node definition provided. The node group is not automatically
+// created on the cloud provider side. The node group is not returned by NodeGroups() until it is created.
+func (gce *GceCloudProvider) NewNodeGroup(machineType string, labels map[string]string, systemLabels map[string]string,
+	extraResources map[string]resource.Quantity) (cloudprovider.NodeGroup, error) {
+	nodePoolName := fmt.Sprintf("%s-%s-%d", nodeAutoprovisioningPrefix, machineType, time.Now().Unix())
+	zone := gce.gceManager.getLocation()
+	taints := make([]apiv1.Taint, 0)
+
+	if gpuRequest, found := extraResources[gpu.ResourceNvidiaGPU]; found {
+		gpuType, found := systemLabels[gpu.GPULabel]
+		if !found {
+			return nil, cloudprovider.ErrIllegalConfiguration
+		}
+		gpuCount, err := getNormalizedGpuCount(gpuRequest.Value())
+		if err != nil {
+			return nil, err
+		}
+		extraResources[gpu.ResourceNvidiaGPU] = *resource.NewQuantity(gpuCount, resource.DecimalSI)
+		err = validateGpuConfig(gpuType, gpuCount, zone, machineType)
+		if err != nil {
+			return nil, err
+		}
+		nodePoolName = fmt.Sprintf("%s-%s-gpu-%d", nodeAutoprovisioningPrefix, machineType, time.Now().Unix())
+		labels[gpu.GPULabel] = gpuType
+
+		taint := apiv1.Taint{
+			Effect: apiv1.TaintEffectNoSchedule,
+			Key:    "gke-accelerator",
+			Value:  gpuType,
+		}
+		taints = append(taints, taint)
+	}
+
+	mig := &Mig{
+		autoprovisioned: true,
+		exist:           false,
+		nodePoolName:    nodePoolName,
+		GceRef: GceRef{
+			Project: gce.gceManager.getProjectId(),
+			Zone:    zone,
+			Name:    nodePoolName + "-temporary-mig",
+		},
+		minSize: minAutoprovisionedSize,
+		maxSize: maxAutoprovisionedSize,
+		spec: &autoprovisioningSpec{
+			machineType:    machineType,
+			labels:         labels,
+			taints:         taints,
+			extraResources: extraResources,
+		},
+		gceManager: gce.gceManager,
+	}
+	_, err := gce.gceManager.getTemplates().buildNodeFromAutoprovisioningSpec(mig)
+	if err != nil {
+		return nil, err
+	}
+	return mig, nil
+}
+
+// GetResourceLimiter returns struct containing limits (max, min) for resources (cores, memory etc.).
+func (gce *GceCloudProvider) GetResourceLimiter() (*cloudprovider.ResourceLimiter, error) {
+	resourceLimiter, err := gce.gceManager.GetResourceLimiter()
+	if err != nil {
+		return nil, err
+	}
+	if resourceLimiter != nil {
+		return resourceLimiter, nil
+	}
+	return gce.resourceLimiterFromFlags, nil
+}
+
+// Refresh is called before every main loop and can be used to dynamically update cloud provider state.
+// In particular the list of node groups returned by NodeGroups can change as a result of CloudProvider.Refresh().
+func (gce *GceCloudProvider) Refresh() error {
+	return gce.gceManager.Refresh()
 }
 
 // GceRef contains s reference to some entity in GCE/GKE world.
@@ -121,14 +220,25 @@ func GceRefFromProviderId(id string) (*GceRef, error) {
 	}, nil
 }
 
-// Mig implements NodeGroup interfrace.
+// Information about what autosprovisioning would like from this mig.
+type autoprovisioningSpec struct {
+	machineType    string
+	labels         map[string]string
+	taints         []apiv1.Taint
+	extraResources map[string]resource.Quantity
+}
+
+// Mig implements NodeGroup interface.
 type Mig struct {
 	GceRef
 
-	gceManager *GceManager
-
-	minSize int
-	maxSize int
+	gceManager      GceManager
+	minSize         int
+	maxSize         int
+	autoprovisioned bool
+	exist           bool
+	nodePoolName    string
+	spec            *autoprovisioningSpec
 }
 
 // MaxSize returns maximum size of the node group.
@@ -142,8 +252,11 @@ func (mig *Mig) MinSize() int {
 }
 
 // TargetSize returns the current TARGET size of the node group. It is possible that the
-// number is different from the number of nodes registered in Kuberentes.
+// number is different from the number of nodes registered in Kubernetes.
 func (mig *Mig) TargetSize() (int, error) {
+	if !mig.exist {
+		return 0, nil
+	}
 	size, err := mig.gceManager.GetMigSize(mig)
 	return int(size), err
 }
@@ -168,7 +281,7 @@ func (mig *Mig) IncreaseSize(delta int) error {
 // request for new nodes that have not been yet fulfilled. Delta should be negative.
 func (mig *Mig) DecreaseTargetSize(delta int) error {
 	if delta >= 0 {
-		return fmt.Errorf("size decrease must be netative")
+		return fmt.Errorf("size decrease must be negative")
 	}
 	size, err := mig.gceManager.GetMigSize(mig)
 	if err != nil {
@@ -247,80 +360,56 @@ func (mig *Mig) Nodes() ([]string, error) {
 	return mig.gceManager.GetMigNodes(mig)
 }
 
+// Exist checks if the node group really exists on the cloud provider side. Allows to tell the
+// theoretical node group from the real one.
+func (mig *Mig) Exist() bool {
+	return mig.exist
+}
+
+// Create creates the node group on the cloud provider side.
+func (mig *Mig) Create() error {
+	if !mig.exist && mig.autoprovisioned {
+		return mig.gceManager.createNodePool(mig)
+	}
+	return fmt.Errorf("Cannot create non-autoprovisioned node group")
+}
+
+// Delete deletes the node group on the cloud provider side.
+// This will be executed only for autoprovisioned node groups, once their size drops to 0.
+func (mig *Mig) Delete() error {
+	if mig.exist && mig.autoprovisioned {
+		return mig.gceManager.deleteNodePool(mig)
+	}
+	return fmt.Errorf("Cannot delete non-autoprovisioned node group")
+}
+
+// Autoprovisioned returns true if the node group is autoprovisioned.
+func (mig *Mig) Autoprovisioned() bool {
+	return mig.autoprovisioned
+}
+
 // TemplateNodeInfo returns a node template for this node group.
 func (mig *Mig) TemplateNodeInfo() (*schedulercache.NodeInfo, error) {
-	template, err := mig.gceManager.getMigTemplate(mig)
-	if err != nil {
-		return nil, err
+	var node *apiv1.Node
+	if mig.Exist() {
+		template, err := mig.gceManager.getTemplates().getMigTemplate(mig)
+		if err != nil {
+			return nil, err
+		}
+		node, err = mig.gceManager.getTemplates().buildNodeFromTemplate(mig, template)
+		if err != nil {
+			return nil, err
+		}
+	} else if mig.Autoprovisioned() {
+		var err error
+		node, err = mig.gceManager.getTemplates().buildNodeFromAutoprovisioningSpec(mig)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		return nil, fmt.Errorf("unable to get node info for %s/%s/%s", mig.Project, mig.Zone, mig.Name)
 	}
-	node, err := mig.gceManager.buildNodeFromTemplate(mig, template)
-	if err != nil {
-		return nil, err
-	}
-	nodeInfo := schedulercache.NewNodeInfo(buildKubeProxy(mig))
+	nodeInfo := schedulercache.NewNodeInfo(cloudprovider.BuildKubeProxy(mig.Id()))
 	nodeInfo.SetNode(node)
 	return nodeInfo, nil
-}
-
-// Builds KubeProxy pod definition
-func buildKubeProxy(mig *Mig) *apiv1.Pod {
-	// TODO: make cpu a flag.
-
-	return &apiv1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      fmt.Sprintf("kube-proxy-%s-%d", mig.Id(), rand.Int63()),
-			Namespace: "kube-system",
-			Annotations: map[string]string{
-				kubetypes.ConfigSourceAnnotationKey: kubetypes.FileSource,
-				kubetypes.CriticalPodAnnotationKey:  "true",
-				kubetypes.ConfigMirrorAnnotationKey: "1234567890abcdef",
-			},
-			Labels: map[string]string{
-				"component": "kube-proxy",
-				"tier":      "node",
-			},
-		},
-		Spec: apiv1.PodSpec{
-			Containers: []apiv1.Container{
-				{
-					Image: "kubeproxy",
-					Resources: apiv1.ResourceRequirements{
-						Requests: apiv1.ResourceList{
-							apiv1.ResourceCPU: *resource.NewMilliQuantity(
-								int64(KubeProxyCpuRequestMillis),
-								resource.DecimalSI),
-						},
-					},
-				},
-			},
-		},
-		Status: apiv1.PodStatus{
-			Phase: apiv1.PodRunning,
-			Conditions: []apiv1.PodCondition{
-				{
-					Type:   apiv1.PodReady,
-					Status: apiv1.ConditionTrue,
-				},
-			},
-		},
-	}
-}
-
-func buildMig(value string, gceManager *GceManager) (*Mig, error) {
-	spec, err := dynamic.SpecFromString(value, true)
-
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse node group spec: %v", err)
-	}
-
-	mig := Mig{
-		gceManager: gceManager,
-		minSize:    spec.MinSize,
-		maxSize:    spec.MaxSize,
-	}
-
-	if mig.Project, mig.Zone, mig.Name, err = ParseMigUrl(spec.Name); err != nil {
-		return nil, fmt.Errorf("failed to parse mig url: %s got error: %v", spec.Name, err)
-	}
-	return &mig, nil
 }

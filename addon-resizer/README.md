@@ -5,6 +5,8 @@ vertically scales the dependent container up and down. Currently the only
 option is to scale it linearly based on the number of nodes, and it only works
 for a singleton.
 
+Currently recommended version is 1.8, on addon-resizer-release-1.8 branch.
+
 ## Nanny program and arguments
 
 The nanny scales resources linearly with the number of nodes in the cluster. The base and marginal resource requirements are given as command line arguments, but you cannot give a marginal requirement without a base requirement.
@@ -21,7 +23,7 @@ Usage of pod_nanny:
       --extra-storage="0Gi": The amount of storage to add per node.
       --log-flush-frequency=5s: Maximum number of seconds between log flushes
       --memory="MISSING": The base memory resource requirement.
-      --namespace=$MY_POD_NAMESPACE: The namespace of the ward. This defaults to the nanny's own pod.
+      --namespace=$MY_POD_NAMESPACE: The namespace of the ward. This defaults to the nanny pod's own namespace.
       --pod=$MY_POD_NAME: The name of the pod to watch. This defaults to the nanny's own pod.
       --poll-period=10000: The time, in milliseconds, to poll the dependent container.
       --storage="MISSING": The base storage resource requirement.
@@ -55,7 +57,7 @@ spec:
         kubernetes.io/cluster-service: "true"
     spec:
       containers:
-        - image: gcr.io/google_containers/addon-resizer:1.0
+        - image: k8s.gcr.io/addon-resizer:1.8
           imagePullPolicy: Always
           name: pod-nanny
           resources:

@@ -14,41 +14,71 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package testprovider
+package test
 
 import (
 	"fmt"
 	"sync"
 
 	apiv1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider"
 	"k8s.io/autoscaler/cluster-autoscaler/utils/errors"
 	"k8s.io/kubernetes/plugin/pkg/scheduler/schedulercache"
 )
 
+// OnScaleUpFunc is a function called on node group increase in TestCloudProvider.
+// First parameter is the NodeGroup id, second is the increase delta.
+type OnScaleUpFunc func(string, int) error
+
+// OnScaleDownFunc is a function called on cluster scale down
+type OnScaleDownFunc func(string, string) error
+
+// OnNodeGroupCreateFunc is a fuction called when a new node group is created.
+type OnNodeGroupCreateFunc func(string) error
+
+// OnNodeGroupDeleteFunc is a function called when a node group is deleted.
+type OnNodeGroupDeleteFunc func(string) error
+
 // TestCloudProvider is a dummy cloud provider to be used in tests.
 type TestCloudProvider struct {
 	sync.Mutex
-	nodes      map[string]string
-	groups     map[string]cloudprovider.NodeGroup
-	onIncrease func(string, int) error
-	onDelete   func(string, string) error
+	nodes             map[string]string
+	groups            map[string]cloudprovider.NodeGroup
+	onScaleUp         func(string, int) error
+	onScaleDown       func(string, string) error
+	onNodeGroupCreate func(string) error
+	onNodeGroupDelete func(string) error
+	machineTypes      []string
+	machineTemplates  map[string]*schedulercache.NodeInfo
+	resourceLimiter   *cloudprovider.ResourceLimiter
 }
 
-// OnIncreaseFunc is a function called on node group increase in TestCloudProvider.
-// First parameter is the NodeGroup id, second is the increase delta.
-type OnIncreaseFunc func(string, int) error
-
-// OnDeleteFunc is a function called on cluster
-type OnDeleteFunc func(string, string) error
-
 // NewTestCloudProvider builds new TestCloudProvider
-func NewTestCloudProvider(onIncrease OnIncreaseFunc, onDelete OnDeleteFunc) *TestCloudProvider {
+func NewTestCloudProvider(onScaleUp OnScaleUpFunc, onScaleDown OnScaleDownFunc) *TestCloudProvider {
 	return &TestCloudProvider{
-		nodes:      make(map[string]string),
-		groups:     make(map[string]cloudprovider.NodeGroup),
-		onIncrease: onIncrease,
-		onDelete:   onDelete,
+		nodes:           make(map[string]string),
+		groups:          make(map[string]cloudprovider.NodeGroup),
+		onScaleUp:       onScaleUp,
+		onScaleDown:     onScaleDown,
+		resourceLimiter: cloudprovider.NewResourceLimiter(make(map[string]int64), make(map[string]int64)),
+	}
+}
+
+// NewTestAutoprovisioningCloudProvider builds new TestCloudProvider with autoprovisioning support
+func NewTestAutoprovisioningCloudProvider(onScaleUp OnScaleUpFunc, onScaleDown OnScaleDownFunc,
+	onNodeGroupCreate OnNodeGroupCreateFunc, onNodeGroupDelete OnNodeGroupDeleteFunc,
+	machineTypes []string, machineTemplates map[string]*schedulercache.NodeInfo) *TestCloudProvider {
+	return &TestCloudProvider{
+		nodes:             make(map[string]string),
+		groups:            make(map[string]cloudprovider.NodeGroup),
+		onScaleUp:         onScaleUp,
+		onScaleDown:       onScaleDown,
+		onNodeGroupCreate: onNodeGroupCreate,
+		onNodeGroupDelete: onNodeGroupDelete,
+		machineTypes:      machineTypes,
+		machineTemplates:  machineTemplates,
+		resourceLimiter:   cloudprovider.NewResourceLimiter(make(map[string]int64), make(map[string]int64)),
 	}
 }
 
@@ -67,6 +97,13 @@ func (tcp *TestCloudProvider) NodeGroups() []cloudprovider.NodeGroup {
 		result = append(result, group)
 	}
 	return result
+}
+
+// GetNodeGroup returns node group with the given name.
+func (tcp *TestCloudProvider) GetNodeGroup(name string) cloudprovider.NodeGroup {
+	tcp.Lock()
+	defer tcp.Unlock()
+	return tcp.groups[name]
 }
 
 // NodeGroupForNode returns the node group for the given node, nil if the node
@@ -92,17 +129,57 @@ func (tcp *TestCloudProvider) Pricing() (cloudprovider.PricingModel, errors.Auto
 	return nil, cloudprovider.ErrNotImplemented
 }
 
+// GetAvailableMachineTypes get all machine types that can be requested from the cloud provider.
+func (tcp *TestCloudProvider) GetAvailableMachineTypes() ([]string, error) {
+	return tcp.machineTypes, nil
+}
+
+// NewNodeGroup builds a theoretical node group based on the node definition provided. The node group is not automatically
+// created on the cloud provider side. The node group is not returned by NodeGroups() until it is created.
+func (tcp *TestCloudProvider) NewNodeGroup(machineType string, labels map[string]string, systemLabels map[string]string,
+	extraResources map[string]resource.Quantity) (cloudprovider.NodeGroup, error) {
+	return &TestNodeGroup{
+		cloudProvider:   tcp,
+		id:              "autoprovisioned-" + machineType,
+		minSize:         0,
+		maxSize:         1000,
+		targetSize:      0,
+		exist:           false,
+		autoprovisioned: true,
+		machineType:     machineType,
+	}, nil
+}
+
 // AddNodeGroup adds node group to test cloud provider.
 func (tcp *TestCloudProvider) AddNodeGroup(id string, min int, max int, size int) {
 	tcp.Lock()
 	defer tcp.Unlock()
 
 	tcp.groups[id] = &TestNodeGroup{
-		cloudProvider: tcp,
-		id:            id,
-		minSize:       min,
-		maxSize:       max,
-		targetSize:    size,
+		cloudProvider:   tcp,
+		id:              id,
+		minSize:         min,
+		maxSize:         max,
+		targetSize:      size,
+		exist:           true,
+		autoprovisioned: false,
+	}
+}
+
+// AddAutoprovisionedNodeGroup adds node group to test cloud provider.
+func (tcp *TestCloudProvider) AddAutoprovisionedNodeGroup(id string, min int, max int, size int, machineType string) {
+	tcp.Lock()
+	defer tcp.Unlock()
+
+	tcp.groups[id] = &TestNodeGroup{
+		cloudProvider:   tcp,
+		id:              id,
+		minSize:         min,
+		maxSize:         max,
+		targetSize:      size,
+		exist:           true,
+		autoprovisioned: true,
+		machineType:     machineType,
 	}
 }
 
@@ -113,14 +190,38 @@ func (tcp *TestCloudProvider) AddNode(nodeGroupId string, node *apiv1.Node) {
 	tcp.nodes[node.Name] = nodeGroupId
 }
 
+// GetResourceLimiter returns struct containing limits (max, min) for resources (cores, memory etc.).
+func (tcp *TestCloudProvider) GetResourceLimiter() (*cloudprovider.ResourceLimiter, error) {
+	return tcp.resourceLimiter, nil
+}
+
+// SetResourceLimiter sets resource limiter.
+func (tcp *TestCloudProvider) SetResourceLimiter(resourceLimiter *cloudprovider.ResourceLimiter) {
+	tcp.resourceLimiter = resourceLimiter
+}
+
+// Cleanup this is a function to close resources associated with the cloud provider
+func (tcp *TestCloudProvider) Cleanup() error {
+	return nil
+}
+
+// Refresh is called before every main loop and can be used to dynamically update cloud provider state.
+// In particular the list of node groups returned by NodeGroups can change as a result of CloudProvider.Refresh().
+func (tcp *TestCloudProvider) Refresh() error {
+	return nil
+}
+
 // TestNodeGroup is a node group used by TestCloudProvider.
 type TestNodeGroup struct {
 	sync.Mutex
-	cloudProvider *TestCloudProvider
-	id            string
-	maxSize       int
-	minSize       int
-	targetSize    int
+	cloudProvider   *TestCloudProvider
+	id              string
+	maxSize         int
+	minSize         int
+	targetSize      int
+	exist           bool
+	autoprovisioned bool
+	machineType     string
 }
 
 // MaxSize returns maximum size of the node group.
@@ -150,6 +251,13 @@ func (tng *TestNodeGroup) TargetSize() (int, error) {
 	return tng.targetSize, nil
 }
 
+// SetTargetSize sets target size for group. Function is used only in tests.
+func (tng *TestNodeGroup) SetTargetSize(size int) {
+	tng.Lock()
+	defer tng.Unlock()
+	tng.targetSize = size
+}
+
 // IncreaseSize increases the size of the node group. To delete a node you need
 // to explicitly name it and use DeleteNode. This function should wait until
 // node group size is updated.
@@ -158,7 +266,30 @@ func (tng *TestNodeGroup) IncreaseSize(delta int) error {
 	tng.targetSize += delta
 	tng.Unlock()
 
-	return tng.cloudProvider.onIncrease(tng.id, delta)
+	return tng.cloudProvider.onScaleUp(tng.id, delta)
+}
+
+// Exist checks if the node group really exists on the cloud provider side. Allows to tell the
+// theoretical node group from the real one.
+func (tng *TestNodeGroup) Exist() bool {
+	tng.Lock()
+	defer tng.Unlock()
+	return tng.exist
+}
+
+// Create creates the node group on the cloud provider side.
+func (tng *TestNodeGroup) Create() error {
+	if tng.Exist() {
+		return fmt.Errorf("Group already exist")
+	}
+	tng.cloudProvider.AddAutoprovisionedNodeGroup(tng.id, tng.minSize, tng.maxSize, 0, tng.machineType)
+	return tng.cloudProvider.onNodeGroupCreate(tng.id)
+}
+
+// Delete deletes the node group on the cloud provider side.
+// This will be executed only for autoprovisioned node groups, once their size drops to 0.
+func (tng *TestNodeGroup) Delete() error {
+	return tng.cloudProvider.onNodeGroupDelete(tng.id)
 }
 
 // DecreaseTargetSize decreases the target size of the node group. This function
@@ -169,7 +300,7 @@ func (tng *TestNodeGroup) DecreaseTargetSize(delta int) error {
 	tng.targetSize += delta
 	tng.Unlock()
 
-	return tng.cloudProvider.onIncrease(tng.id, delta)
+	return tng.cloudProvider.onScaleUp(tng.id, delta)
 }
 
 // DeleteNodes deletes nodes from this node group. Error is returned either on
@@ -181,7 +312,7 @@ func (tng *TestNodeGroup) DeleteNodes(nodes []*apiv1.Node) error {
 	tng.targetSize -= len(nodes)
 	tng.Unlock()
 	for _, node := range nodes {
-		err := tng.cloudProvider.onDelete(id, node.Name)
+		err := tng.cloudProvider.onScaleDown(id, node.Name)
 		if err != nil {
 			return err
 		}
@@ -219,7 +350,26 @@ func (tng *TestNodeGroup) Nodes() ([]string, error) {
 	return result, nil
 }
 
+// Autoprovisioned returns true if the node group is autoprovisioned.
+func (tng *TestNodeGroup) Autoprovisioned() bool {
+	return tng.autoprovisioned
+}
+
 // TemplateNodeInfo returns a node template for this node group.
 func (tng *TestNodeGroup) TemplateNodeInfo() (*schedulercache.NodeInfo, error) {
-	return nil, cloudprovider.ErrNotImplemented
+	if tng.cloudProvider.machineTemplates == nil {
+		return nil, cloudprovider.ErrNotImplemented
+	}
+	if tng.autoprovisioned {
+		template, found := tng.cloudProvider.machineTemplates[tng.machineType]
+		if !found {
+			return nil, fmt.Errorf("No template declared for %s", tng.machineType)
+		}
+		return template, nil
+	}
+	template, found := tng.cloudProvider.machineTemplates[tng.id]
+	if !found {
+		return nil, fmt.Errorf("No template declared for %s", tng.id)
+	}
+	return template, nil
 }

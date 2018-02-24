@@ -20,8 +20,8 @@ import (
 	"fmt"
 	apiv1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	kube_client "k8s.io/client-go/kubernetes"
 	kube_record "k8s.io/client-go/tools/record"
-	kube_client "k8s.io/kubernetes/pkg/client/clientset_generated/clientset"
 )
 
 // ConfigFetcher fetches the up-to-date dynamic configuration from the apiserver
@@ -58,7 +58,7 @@ func NewConfigFetcher(options ConfigFetcherOptions, kubeClient kube_client.Inter
 // Returns the config if it has changed since the last sync. Returns nil if it has not changed.
 func (c *configFetcherImpl) FetchConfigIfUpdated() (*Config, error) {
 	opts := metav1.GetOptions{}
-	cm, err := c.kubeClient.Core().ConfigMaps(c.namespace).Get(c.configMapName, opts)
+	cm, err := c.kubeClient.CoreV1().ConfigMaps(c.namespace).Get(c.configMapName, opts)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch config map named %s in namespace %s. please confirm if the configmap name and the namespace are correctly spelled and you've already created the configmap: %v", c.configMapName, c.namespace, err)
 	}

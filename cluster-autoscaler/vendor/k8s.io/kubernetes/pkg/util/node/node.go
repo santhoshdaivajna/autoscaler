@@ -29,8 +29,9 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/strategicpatch"
-	"k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/client/clientset_generated/clientset"
+	clientset "k8s.io/client-go/kubernetes"
+	v1core "k8s.io/client-go/kubernetes/typed/core/v1"
+	api "k8s.io/kubernetes/pkg/apis/core"
 	kubeletapis "k8s.io/kubernetes/pkg/kubelet/apis"
 )
 
@@ -145,12 +146,27 @@ func SetNodeCondition(c clientset.Interface, node types.NodeName, condition v1.N
 	if err != nil {
 		return nil
 	}
-	_, err = c.Core().Nodes().PatchStatus(string(node), patch)
+	_, err = c.CoreV1().Nodes().PatchStatus(string(node), patch)
 	return err
 }
 
+// PatchNodeCIDR patches the specified node's CIDR to the given value.
+func PatchNodeCIDR(c clientset.Interface, node types.NodeName, cidr string) error {
+	raw, err := json.Marshal(cidr)
+	if err != nil {
+		return fmt.Errorf("failed to json.Marshal CIDR: %v", err)
+	}
+
+	patchBytes := []byte(fmt.Sprintf(`{"spec":{"podCIDR":%s}}`, raw))
+
+	if _, err := c.CoreV1().Nodes().Patch(string(node), types.StrategicMergePatchType, patchBytes); err != nil {
+		return fmt.Errorf("failed to patch node CIDR: %v", err)
+	}
+	return nil
+}
+
 // PatchNodeStatus patches node status.
-func PatchNodeStatus(c clientset.Interface, nodeName types.NodeName, oldNode *v1.Node, newNode *v1.Node) (*v1.Node, error) {
+func PatchNodeStatus(c v1core.CoreV1Interface, nodeName types.NodeName, oldNode *v1.Node, newNode *v1.Node) (*v1.Node, error) {
 	oldData, err := json.Marshal(oldNode)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal old node %#v for node %q: %v", oldNode, nodeName, err)
@@ -171,7 +187,7 @@ func PatchNodeStatus(c clientset.Interface, nodeName types.NodeName, oldNode *v1
 		return nil, fmt.Errorf("failed to create patch for node %q: %v", nodeName, err)
 	}
 
-	updatedNode, err := c.Core().Nodes().Patch(string(nodeName), types.StrategicMergePatchType, patchBytes, "status")
+	updatedNode, err := c.Nodes().Patch(string(nodeName), types.StrategicMergePatchType, patchBytes, "status")
 	if err != nil {
 		return nil, fmt.Errorf("failed to patch status %q for node %q: %v", patchBytes, nodeName, err)
 	}

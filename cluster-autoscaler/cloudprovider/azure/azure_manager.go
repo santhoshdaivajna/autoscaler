@@ -1,5 +1,5 @@
 /*
-Copyright 2016 The Kubernetes Authors.
+Copyright 2017 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,400 +17,403 @@ limitations under the License.
 package azure
 
 import (
+	"fmt"
 	"io"
-	"sync"
+	"os"
+	"strconv"
+	"strings"
 	"time"
 
-	"github.com/Azure/azure-sdk-for-go/arm/compute"
-	"github.com/golang/glog"
-	"gopkg.in/gcfg.v1"
-
-	"bytes"
-	"fmt"
-	"github.com/Azure/go-autorest/autorest"
 	"github.com/Azure/go-autorest/autorest/azure"
-	"k8s.io/apimachinery/pkg/util/wait"
-	"net/http"
-	"os"
-	"strings"
+	"github.com/golang/glog"
+
+	"gopkg.in/gcfg.v1"
+	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider"
+	"k8s.io/autoscaler/cluster-autoscaler/config/dynamic"
 )
 
-type scaleSetInformation struct {
-	config   *ScaleSet
-	basename string
-}
+const (
+	vmTypeVMSS     = "vmss"
+	vmTypeStandard = "standard"
 
-type scaleSetClient interface {
-	Get(resourceGroupName string, vmScaleSetName string) (result compute.VirtualMachineScaleSet, err error)
-	CreateOrUpdate(resourceGroupName string, name string, parameters compute.VirtualMachineScaleSet, cancel <-chan struct{}) (result autorest.Response, err error)
-	DeleteInstances(resourceGroupName string, vmScaleSetName string, vmInstanceIDs compute.VirtualMachineScaleSetVMInstanceRequiredIDs, cancel <-chan struct{}) (result autorest.Response, err error)
-}
-
-type scaleSetVMClient interface {
-	List(resourceGroupName string, virtualMachineScaleSetName string, filter string, selectParameter string, expand string) (result compute.VirtualMachineScaleSetVMListResult, err error)
-}
+	scaleToZeroSupported = false
+	refreshInterval      = 1 * time.Minute
+)
 
 // AzureManager handles Azure communication and data caching.
 type AzureManager struct {
-	resourceGroupName string
-	subscription      string
-	scaleSetClient    scaleSetClient
-	scaleSetVmClient  scaleSetVMClient
+	config   *Config
+	azClient *azClient
+	env      azure.Environment
 
-	scaleSets     []*scaleSetInformation
-	scaleSetCache map[AzureRef]*ScaleSet
-
-	// cache of mapping from instance id to the scale set id
-	scaleSetIdCache map[string]string
-
-	cacheMutex sync.Mutex
+	asgCache              *asgCache
+	lastRefresh           time.Time
+	asgAutoDiscoverySpecs []cloudprovider.LabelAutoDiscoveryConfig
+	explicitlyConfigured  map[string]bool
 }
 
 // Config holds the configuration parsed from the --cloud-config flag
 type Config struct {
-	Cloud                      string `json:"cloud" yaml:"cloud"`
-	TenantID                   string `json:"tenantId" yaml:"tenantId"`
-	SubscriptionID             string `json:"subscriptionId" yaml:"subscriptionId"`
-	ResourceGroup              string `json:"resourceGroup" yaml:"resourceGroup"`
-	Location                   string `json:"location" yaml:"location"`
-	VnetName                   string `json:"vnetName" yaml:"vnetName"`
-	SubnetName                 string `json:"subnetName" yaml:"subnetName"`
-	SecurityGroupName          string `json:"securityGroupName" yaml:"securityGroupName"`
-	RouteTableName             string `json:"routeTableName" yaml:"routeTableName"`
-	PrimaryAvailabilitySetName string `json:"primaryAvailabilitySetName" yaml:"primaryAvailabilitySetName"`
+	Cloud          string `json:"cloud" yaml:"cloud"`
+	TenantID       string `json:"tenantId" yaml:"tenantId"`
+	SubscriptionID string `json:"subscriptionId" yaml:"subscriptionId"`
+	ResourceGroup  string `json:"resourceGroup" yaml:"resourceGroup"`
+	VMType         string `json:"vmType" yaml:"vmType"`
 
-	AADClientID     string `json:"aadClientId" yaml:"aadClientId"`
-	AADClientSecret string `json:"aadClientSecret" yaml:"aadClientSecret"`
-	AADTenantID     string `json:"aadTenantId" yaml:"aadTenantId"`
+	AADClientID                 string `json:"aadClientId" yaml:"aadClientId"`
+	AADClientSecret             string `json:"aadClientSecret" yaml:"aadClientSecret"`
+	AADClientCertPath           string `json:"aadClientCertPath" yaml:"aadClientCertPath"`
+	AADClientCertPassword       string `json:"aadClientCertPassword" yaml:"aadClientCertPassword"`
+	UseManagedIdentityExtension bool   `json:"useManagedIdentityExtension" yaml:"useManagedIdentityExtension"`
+
+	// Configs only for standard vmType (agent pools).
+	Deployment           string `json:"deployment" yaml:"deployment"`
+	APIServerPrivateKey  string `json:"apiServerPrivateKey" yaml:"apiServerPrivateKey"`
+	CAPrivateKey         string `json:"caPrivateKey" yaml:"caPrivateKey"`
+	ClientPrivateKey     string `json:"clientPrivateKey" yaml:"clientPrivateKey"`
+	KubeConfigPrivateKey string `json:"kubeConfigPrivateKey" yaml:"kubeConfigPrivateKey"`
+	WindowsAdminPassword string `json:"windowsAdminPassword" yaml:"windowsAdminPassword"`
+	// etcd TLS parameters (for acs-engine >= v0.12.0).
+	EtcdClientPrivateKey string `json:"etcdClientPrivateKey" yaml:"etcdClientPrivateKey"`
+	EtcdServerPrivateKey string `json:"etcdServerPrivateKey" yaml:"etcdServerPrivateKey"`
+}
+
+// TrimSpace removes all leading and trailing white spaces.
+func (c *Config) TrimSpace() {
+	c.Cloud = strings.TrimSpace(c.Cloud)
+	c.TenantID = strings.TrimSpace(c.TenantID)
+	c.SubscriptionID = strings.TrimSpace(c.SubscriptionID)
+	c.ResourceGroup = strings.TrimSpace(c.ResourceGroup)
+	c.VMType = strings.TrimSpace(c.VMType)
+	c.AADClientID = strings.TrimSpace(c.AADClientID)
+	c.AADClientSecret = strings.TrimSpace(c.AADClientSecret)
+	c.AADClientCertPath = strings.TrimSpace(c.AADClientCertPath)
+	c.AADClientCertPassword = strings.TrimSpace(c.AADClientCertPassword)
+	c.Deployment = strings.TrimSpace(c.Deployment)
+	c.APIServerPrivateKey = strings.TrimSpace(c.APIServerPrivateKey)
+	c.CAPrivateKey = strings.TrimSpace(c.CAPrivateKey)
+	c.ClientPrivateKey = strings.TrimSpace(c.ClientPrivateKey)
+	c.KubeConfigPrivateKey = strings.TrimSpace(c.KubeConfigPrivateKey)
+	c.WindowsAdminPassword = strings.TrimSpace(c.WindowsAdminPassword)
+	c.EtcdClientPrivateKey = strings.TrimSpace(c.EtcdClientPrivateKey)
+	c.EtcdServerPrivateKey = strings.TrimSpace(c.EtcdServerPrivateKey)
 }
 
 // CreateAzureManager creates Azure Manager object to work with Azure.
-func CreateAzureManager(configReader io.Reader) (*AzureManager, error) {
-	subscriptionId := string("")
-	resourceGroup := string("")
-	tenantId := string("")
-	clientId := string("")
-	clientSecret := string("")
-	var scaleSetAPI scaleSetClient
-	var scaleSetVmAPI scaleSetVMClient
+func CreateAzureManager(configReader io.Reader, discoveryOpts cloudprovider.NodeGroupDiscoveryOptions) (*AzureManager, error) {
+	var err error
+	var cfg Config
+
 	if configReader != nil {
-		var cfg Config
 		if err := gcfg.ReadInto(&cfg, configReader); err != nil {
 			glog.Errorf("Couldn't read config: %v", err)
 			return nil, err
 		}
-		subscriptionId = cfg.SubscriptionID
-		resourceGroup = cfg.ResourceGroup
-		tenantId = cfg.AADTenantID
-		clientId = cfg.AADClientID
-		clientSecret = cfg.AADClientSecret
-
 	} else {
-		subscriptionId = os.Getenv("ARM_SUBSCRIPTION_ID")
-		resourceGroup = os.Getenv("ARM_RESOURCE_GROUP")
-		tenantId = os.Getenv("ARM_TENANT_ID")
-		clientId = os.Getenv("ARM_CLIENT_ID")
-		clientSecret = os.Getenv("ARM_CLIENT_SECRET")
-	}
+		cfg.Cloud = os.Getenv("ARM_CLOUD")
+		cfg.SubscriptionID = os.Getenv("ARM_SUBSCRIPTION_ID")
+		cfg.ResourceGroup = os.Getenv("ARM_RESOURCE_GROUP")
+		cfg.TenantID = os.Getenv("ARM_TENANT_ID")
+		cfg.AADClientID = os.Getenv("ARM_CLIENT_ID")
+		cfg.AADClientSecret = os.Getenv("ARM_CLIENT_SECRET")
+		cfg.VMType = strings.ToLower(os.Getenv("ARM_VM_TYPE"))
+		cfg.AADClientCertPath = os.Getenv("ARM_CLIENT_CERT_PATH")
+		cfg.AADClientCertPassword = os.Getenv("ARM_CLIENT_CERT_PASSWORD")
+		cfg.Deployment = os.Getenv("ARM_DEPLOYMENT")
+		cfg.APIServerPrivateKey = os.Getenv("ARM_APISEVER_PRIVATE_KEY")
+		cfg.CAPrivateKey = os.Getenv("ARM_CA_PRIVATE_KEY")
+		cfg.ClientPrivateKey = os.Getenv("ARM_CLIENT_PRIVATE_KEY")
+		cfg.KubeConfigPrivateKey = os.Getenv("ARM_KUBECONFIG_PRIVATE_KEY")
+		cfg.WindowsAdminPassword = os.Getenv("ARM_WINDOWS_ADMIN_PASSWORD")
+		cfg.EtcdClientPrivateKey = os.Getenv("ARM_ETCD_CLIENT_RPIVATE_KEY")
+		cfg.EtcdServerPrivateKey = os.Getenv("ARM_ETCD_SERVER_PRIVATE_KEY")
 
-	if resourceGroup == "" {
-		panic("Resource group not found")
-	}
-
-	if subscriptionId == "" {
-		panic("Subscription ID not found")
-	}
-
-	if tenantId == "" {
-		panic("Tenant ID not found.")
-	}
-
-	if clientId == "" {
-		panic("ARM Client  ID not found")
-	}
-
-	if clientSecret == "" {
-		panic("ARM Client Secret not found.")
-	}
-
-	glog.Infof("read configuration: %v", subscriptionId)
-
-	spt, err := NewServicePrincipalTokenFromCredentials(tenantId, clientId, clientSecret, azure.PublicCloud.ServiceManagementEndpoint)
-	if err != nil {
-		panic(err)
-	}
-
-	scaleSetAPI = compute.NewVirtualMachineScaleSetsClient(subscriptionId)
-	scaleSetsClient := scaleSetAPI.(compute.VirtualMachineScaleSetsClient)
-	scaleSetsClient.Authorizer = spt
-
-	scaleSetsClient.Sender = autorest.CreateSender(
-	//autorest.WithLogging(log.New(os.Stdout, "sdk-example: ", log.LstdFlags)),
-	)
-
-	//scaleSetsClient.RequestInspector = withInspection()
-	//scaleSetsClient.ResponseInspector = byInspecting()
-
-	glog.Infof("Created scale set client with authorizer: %v", scaleSetsClient)
-
-	scaleSetVmAPI = compute.NewVirtualMachineScaleSetVMsClient(subscriptionId)
-	scaleSetVMsClient := scaleSetVmAPI.(compute.VirtualMachineScaleSetVMsClient)
-	scaleSetVMsClient.Authorizer = spt
-	scaleSetVMsClient.RequestInspector = withInspection()
-	scaleSetVMsClient.ResponseInspector = byInspecting()
-
-	glog.Infof("Created scale set vm client with authorizer: %v", scaleSetVMsClient)
-
-	// Create Availability Sets Azure Client.
-	manager := &AzureManager{
-		subscription:      subscriptionId,
-		resourceGroupName: resourceGroup,
-		scaleSetClient:    scaleSetsClient,
-		scaleSetVmClient:  scaleSetVMsClient,
-		scaleSets:         make([]*scaleSetInformation, 0),
-		scaleSetCache:     make(map[AzureRef]*ScaleSet),
-	}
-
-	go wait.Forever(func() {
-		manager.cacheMutex.Lock()
-		defer manager.cacheMutex.Unlock()
-		if err := manager.regenerateCache(); err != nil {
-			glog.Errorf("Error while regenerating AS cache: %v", err)
+		useManagedIdentityExtensionFromEnv := os.Getenv("ARM_USE_MANAGED_IDENTITY_EXTENSION")
+		if len(useManagedIdentityExtensionFromEnv) > 0 {
+			cfg.UseManagedIdentityExtension, err = strconv.ParseBool(useManagedIdentityExtensionFromEnv)
+			if err != nil {
+				return nil, err
+			}
 		}
-	}, time.Hour)
+	}
+	cfg.TrimSpace()
+
+	// Defaulting vmType to vmss.
+	if cfg.VMType == "" {
+		cfg.VMType = vmTypeVMSS
+	}
+
+	// Defaulting env to Azure Public Cloud.
+	env := azure.PublicCloud
+	if cfg.Cloud != "" {
+		env, err = azure.EnvironmentFromName(cfg.Cloud)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if err := validateConfig(&cfg); err != nil {
+		return nil, err
+	}
+
+	glog.Infof("Starting azure manager with subscription ID %q", cfg.SubscriptionID)
+
+	azClient, err := newAzClient(&cfg, &env)
+	if err != nil {
+		return nil, err
+	}
+
+	// Create azure manager.
+	manager := &AzureManager{
+		config:               &cfg,
+		env:                  env,
+		azClient:             azClient,
+		explicitlyConfigured: make(map[string]bool),
+	}
+
+	cache, err := newAsgCache()
+	if err != nil {
+		return nil, err
+	}
+	manager.asgCache = cache
+
+	specs, err := discoveryOpts.ParseLabelAutoDiscoverySpecs()
+	if err != nil {
+		return nil, err
+	}
+	manager.asgAutoDiscoverySpecs = specs
+
+	if err := manager.fetchExplicitAsgs(discoveryOpts.NodeGroupSpecs); err != nil {
+		return nil, err
+	}
+
+	if err := manager.forceRefresh(); err != nil {
+		return nil, err
+	}
 
 	return manager, nil
 }
 
-// NewServicePrincipalTokenFromCredentials creates a new ServicePrincipalToken using values of the
-// passed credentials map.
-func NewServicePrincipalTokenFromCredentials(tenantId string, clientId string, clientSecret string, scope string) (*azure.ServicePrincipalToken, error) {
-	oauthConfig, err := azure.PublicCloud.OAuthConfigForTenant(tenantId)
-	if err != nil {
-		panic(err)
-	}
-	return azure.NewServicePrincipalToken(*oauthConfig, clientId, clientSecret, scope)
-}
-
-func withInspection() autorest.PrepareDecorator {
-	return func(p autorest.Preparer) autorest.Preparer {
-		return autorest.PreparerFunc(func(r *http.Request) (*http.Request, error) {
-			glog.Infof("Inspecting Request: %s %s\n", r.Method, r.URL)
-			return p.Prepare(r)
-		})
-	}
-}
-
-func byInspecting() autorest.RespondDecorator {
-	return func(r autorest.Responder) autorest.Responder {
-		return autorest.ResponderFunc(func(resp *http.Response) error {
-			glog.Infof("Inspecting Response: %s for %s %s\n", resp.Status, resp.Request.Method, resp.Request.URL)
-			return r.Respond(resp)
-		})
-	}
-}
-
-// RegisterScaleSet registers scale set in Azure Manager.
-func (m *AzureManager) RegisterScaleSet(scaleSet *ScaleSet) {
-	m.cacheMutex.Lock()
-	defer m.cacheMutex.Unlock()
-
-	m.scaleSets = append(m.scaleSets,
-		&scaleSetInformation{
-			config:   scaleSet,
-			basename: scaleSet.Name,
-		})
-
-}
-
-// GetScaleSetSize gets Scale Set size.
-func (m *AzureManager) GetScaleSetSize(asConfig *ScaleSet) (int64, error) {
-	fmt.Printf("Get scale set size: %v\n", asConfig)
-	set, err := m.scaleSetClient.Get(m.resourceGroupName, asConfig.Name)
-	if err != nil {
-		return -1, err
-	}
-	fmt.Printf("Returning scale set capacity: %d\n", *set.Sku.Capacity)
-	return *set.Sku.Capacity, nil
-}
-
-// SetScaleSetSize sets ScaleSet size.
-func (m *AzureManager) SetScaleSetSize(asConfig *ScaleSet, size int64) error {
-	op, err := m.scaleSetClient.Get(m.resourceGroupName, asConfig.Name)
-	if err != nil {
-		return err
-	}
-	op.Sku.Capacity = &size
-	op.VirtualMachineScaleSetProperties.ProvisioningState = nil
-	cancel := make(chan struct{})
-	_, err = m.scaleSetClient.CreateOrUpdate(m.resourceGroupName, asConfig.Name, op, cancel)
-
-	if err != nil {
-		return err
-	}
-	return nil
-}
-
-// GetScaleSetForInstance returns ScaleSetConfig of the given Instance
-func (m *AzureManager) GetScaleSetForInstance(instance *AzureRef) (*ScaleSet, error) {
-	fmt.Printf("Looking for scale set for instance: %v\n", instance)
-	//if m.resourceGroupName == "" {
-	//	m.resourceGroupName = instance.ResourceGroup
-	//}
-
-	fmt.Printf("Cache BEFORE: %v\n", m.scaleSetCache)
-
-	m.cacheMutex.Lock()
-	defer m.cacheMutex.Unlock()
-	if config, found := m.scaleSetCache[*instance]; found {
-		return config, nil
-	}
-	if err := m.regenerateCache(); err != nil {
-		return nil, fmt.Errorf("Error while looking for ScaleSet for instance %+v, error: %v", *instance, err)
-	}
-
-	fmt.Printf("Cache AFTER: %v\n", m.scaleSetCache)
-
-	if config, found := m.scaleSetCache[*instance]; found {
-		return config, nil
-	}
-	// instance does not belong to any configured Scale Set
-	return nil, nil
-}
-
-// DeleteInstances deletes the given instances. All instances must be controlled by the same ASG.
-func (m *AzureManager) DeleteInstances(instances []*AzureRef) error {
-	if len(instances) == 0 {
-		return nil
-	}
-	commonAsg, err := m.GetScaleSetForInstance(instances[0])
-	if err != nil {
-		return err
-	}
-	for _, instance := range instances {
-		asg, err := m.GetScaleSetForInstance(instance)
+func (m *AzureManager) fetchExplicitAsgs(specs []string) error {
+	changed := false
+	for _, spec := range specs {
+		asg, err := m.buildAsgFromSpec(spec)
 		if err != nil {
+			return fmt.Errorf("failed to parse node group spec: %v", err)
+		}
+		if m.RegisterAsg(asg) {
+			changed = true
+		}
+		m.explicitlyConfigured[asg.Id()] = true
+	}
+
+	if changed {
+		if err := m.regenerateCache(); err != nil {
 			return err
 		}
-		if asg != commonAsg {
-			return fmt.Errorf("Cannot delete instances which don't belong to the same Scale Set.")
+	}
+	return nil
+}
+
+func (m *AzureManager) buildAsgFromSpec(spec string) (cloudprovider.NodeGroup, error) {
+	s, err := dynamic.SpecFromString(spec, scaleToZeroSupported)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse node group spec: %v", err)
+	}
+
+	switch m.config.VMType {
+	case vmTypeStandard:
+		return NewAgentPool(s, m)
+	case vmTypeVMSS:
+		return NewScaleSet(s, m)
+	default:
+		return nil, fmt.Errorf("vmtype %s not supported", m.config.VMType)
+	}
+}
+
+// Refresh is called before every main loop and can be used to dynamically update cloud provider state.
+// In particular the list of node groups returned by NodeGroups can change as a result of CloudProvider.Refresh().
+func (m *AzureManager) Refresh() error {
+	if m.lastRefresh.Add(refreshInterval).After(time.Now()) {
+		return nil
+	}
+	return m.forceRefresh()
+}
+
+func (m *AzureManager) forceRefresh() error {
+	if err := m.fetchAutoAsgs(); err != nil {
+		glog.Errorf("Failed to fetch ASGs: %v", err)
+		return err
+	}
+	m.lastRefresh = time.Now()
+	glog.V(2).Infof("Refreshed ASG list, next refresh after %v", m.lastRefresh.Add(refreshInterval))
+	return nil
+}
+
+// Fetch automatically discovered ASGs. These ASGs should be unregistered if
+// they no longer exist in Azure.
+func (m *AzureManager) fetchAutoAsgs() error {
+	groups, err := m.getFilteredAutoscalingGroups(m.asgAutoDiscoverySpecs)
+	if err != nil {
+		return fmt.Errorf("cannot autodiscover ASGs: %s", err)
+	}
+
+	changed := false
+	exists := make(map[string]bool)
+	for _, asg := range groups {
+		asgID := asg.Id()
+		exists[asgID] = true
+		if m.explicitlyConfigured[asgID] {
+			// This ASG was explicitly configured, but would also be
+			// autodiscovered. We want the explicitly configured min and max
+			// nodes to take precedence.
+			glog.V(3).Infof("Ignoring explicitly configured ASG %s for autodiscovery.", asg.Id())
+			continue
+		}
+		if m.RegisterAsg(asg) {
+			glog.V(3).Infof("Autodiscovered ASG %s using tags %v", asg.Id(), m.asgAutoDiscoverySpecs)
+			changed = true
 		}
 	}
 
-	instanceIds := make([]string, len(instances))
-	for i, instance := range instances {
-		instanceIds[i] = m.scaleSetIdCache[instance.Name]
-	}
-	requiredIds := &compute.VirtualMachineScaleSetVMInstanceRequiredIDs{
-		InstanceIds: &instanceIds,
-	}
-	cancel := make(chan struct{})
-	resp, err := m.scaleSetClient.DeleteInstances(m.resourceGroupName, commonAsg.Name, *requiredIds, cancel)
-	if err != nil {
-		return err
+	for _, asg := range m.getAsgs() {
+		asgID := asg.Id()
+		if !exists[asgID] && !m.explicitlyConfigured[asgID] {
+			m.UnregisterAsg(asg)
+			changed = true
+		}
 	}
 
-	glog.V(4).Infof(resp.Status)
+	if changed {
+		if err := m.regenerateCache(); err != nil {
+			return err
+		}
+	}
 
 	return nil
+}
+
+func (m *AzureManager) getAsgs() []cloudprovider.NodeGroup {
+	return m.asgCache.get()
+}
+
+// RegisterAsg registers an ASG.
+func (m *AzureManager) RegisterAsg(asg cloudprovider.NodeGroup) bool {
+	return m.asgCache.Register(asg)
+}
+
+// UnregisterAsg unregisters an ASG.
+func (m *AzureManager) UnregisterAsg(asg cloudprovider.NodeGroup) bool {
+	return m.asgCache.Unregister(asg)
+}
+
+// GetAsgForInstance returns AsgConfig of the given Instance
+func (m *AzureManager) GetAsgForInstance(instance *azureRef) (cloudprovider.NodeGroup, error) {
+	return m.asgCache.FindForInstance(instance, m.config.VMType)
 }
 
 func (m *AzureManager) regenerateCache() error {
-
-	newCache := make(map[AzureRef]*ScaleSet)
-	newScaleSetIdCache := make(map[string]string)
-	for _, sset := range m.scaleSets {
-
-		glog.V(4).Infof("Regenerating Scale Set information for %s", sset.config.Name)
-
-		scaleSet, err := m.scaleSetClient.Get(m.resourceGroupName, sset.config.Name)
-		if err != nil {
-			glog.V(4).Infof("Failed AS info request for %s: %v", sset.config.Name, err)
-			return err
-		}
-		sset.basename = *scaleSet.Name
-
-		result, err := m.scaleSetVmClient.List(m.resourceGroupName, sset.basename, "", "", "")
-
-		if err != nil {
-			glog.V(4).Infof("Failed AS info request for %s: %v", sset.config.Name, err)
-			return err
-		}
-
-		for _, instance := range *result.Value {
-			var name = "azure:////" + fixEndiannessUUID(string(strings.ToUpper(*instance.VirtualMachineScaleSetVMProperties.VMID)))
-			ref := AzureRef{
-				Name: name,
-			}
-			newCache[ref] = sset.config
-
-			newScaleSetIdCache[name] = *instance.InstanceID
-		}
-	}
-
-	m.scaleSetCache = newCache
-	m.scaleSetIdCache = newScaleSetIdCache
-	return nil
+	m.asgCache.mutex.Lock()
+	defer m.asgCache.mutex.Unlock()
+	return m.asgCache.regenerate()
 }
 
-// GetScaleSetVms returns list of nodes for the given scale set.
-func (m *AzureManager) GetScaleSetVms(scaleSet *ScaleSet) ([]string, error) {
-	instances, err := m.scaleSetVmClient.List(m.resourceGroupName, scaleSet.Name, "", "", "")
+// Cleanup the ASG cache.
+func (m *AzureManager) Cleanup() {
+	m.asgCache.Cleanup()
+}
 
+func (m *AzureManager) getFilteredAutoscalingGroups(filter []cloudprovider.LabelAutoDiscoveryConfig) (asgs []cloudprovider.NodeGroup, err error) {
+	if len(filter) == 0 {
+		return nil, nil
+	}
+
+	switch m.config.VMType {
+	case vmTypeVMSS:
+		asgs, err = m.listScaleSets(filter)
+	case vmTypeStandard:
+		asgs, err = m.listAgentPools(filter)
+	default:
+		err = fmt.Errorf("vmType %q not supported", m.config.VMType)
+	}
 	if err != nil {
-		glog.V(4).Infof("Failed AS info request for %s: %v", scaleSet.Name, err)
-		return []string{}, err
+		return nil, err
 	}
-	result := make([]string, 0)
-	for _, instance := range *instances.Value {
-		var name = "azure:////" + fixEndiannessUUID(string(strings.ToUpper(*instance.VirtualMachineScaleSetVMProperties.VMID)))
 
-		result = append(result, name)
-	}
-	return result, nil
-
+	return asgs, nil
 }
 
-// fixEndiannessUUID fixes UUID representation broken because of the bug in linux kernel.
-// According to RFC 4122 (http://tools.ietf.org/html/rfc4122), Section 4.1.2 first three fields have Big Endian encoding.
-// There is a bug in DMI code in Linux kernel (https://bugs.launchpad.net/ubuntu/+source/linux/+bug/1551419) which
-// prevents proper reading of UUID, so, there is a situation, when VMID read by kubernetes on the host is different from
-// VMID reported by Azure REST API. To fix it, we need manually fix Big Endianness on first three fields of UUID.
-func fixEndiannessUUID(uuid string) string {
-	if len(uuid) != 36 {
-		panic("Passed string is not an UUID: " + uuid)
-	}
-	sections := strings.Split(uuid, "-")
-	if len(sections) != 5 {
-		panic("Passed string is not an UUID: " + uuid)
+// listScaleSets gets a list of scale sets and instanceIDs.
+func (m *AzureManager) listScaleSets(filter []cloudprovider.LabelAutoDiscoveryConfig) (asgs []cloudprovider.NodeGroup, err error) {
+	result, err := m.azClient.virtualMachineScaleSetsClient.List(m.config.ResourceGroup)
+	if err != nil {
+		glog.Errorf("VirtualMachineScaleSetsClient.List for %v failed: %v", m.config.ResourceGroup, err)
+		return nil, err
 	}
 
-	var buffer bytes.Buffer
-	buffer.WriteString(reverseBytes(sections[0]))
-	buffer.WriteString("-")
-	buffer.WriteString(reverseBytes(sections[1]))
-	buffer.WriteString("-")
-	buffer.WriteString(reverseBytes(sections[2]))
-	buffer.WriteString("-")
-	buffer.WriteString(sections[3])
-	buffer.WriteString("-")
-	buffer.WriteString(sections[4])
-	return buffer.String()
+	moreResults := (result.Value != nil && len(*result.Value) > 0)
+	for moreResults {
+		for _, scaleSet := range *result.Value {
+			if len(filter) > 0 {
+				if scaleSet.Tags == nil || len(*scaleSet.Tags) == 0 {
+					continue
+				}
+
+				if !matchDiscoveryConfig(*scaleSet.Tags, filter) {
+					continue
+				}
+			}
+
+			spec := &dynamic.NodeGroupSpec{
+				Name:               *scaleSet.Name,
+				MinSize:            1,
+				MaxSize:            -1,
+				SupportScaleToZero: scaleToZeroSupported,
+			}
+			asg, _ := NewScaleSet(spec, m)
+			asgs = append(asgs, asg)
+		}
+		moreResults = false
+
+		if result.NextLink != nil {
+			result, err = m.azClient.virtualMachineScaleSetsClient.ListNextResults(result)
+			if err != nil {
+				glog.Errorf("VirtualMachineScaleSetsClient.ListNextResults for %v failed: %v", m.config.ResourceGroup, err)
+				return nil, err
+			}
+
+			moreResults = (result.Value != nil && len(*result.Value) > 0)
+		}
+
+	}
+
+	return asgs, nil
 }
 
-// reverseBytes is a helper function used by fixEndiannessUUID.
-// it reverses order of pairs of bytes in string. i.e. passing ABCD will produce CDAB.
-func reverseBytes(s string) string {
-	// string length should be even.
-	if len(s)%2 != 0 {
-		panic("Passed string should have even length: " + s)
+// listAgentPools gets a list of agent pools and instanceIDs.
+// Note: filter won't take effect for agent pools.
+func (m *AzureManager) listAgentPools(filter []cloudprovider.LabelAutoDiscoveryConfig) (asgs []cloudprovider.NodeGroup, err error) {
+	deploy, err := m.azClient.deploymentsClient.Get(m.config.ResourceGroup, m.config.Deployment)
+	if err != nil {
+		glog.Errorf("deploymentsClient.Get(%s, %s) failed: %v", m.config.ResourceGroup, m.config.Deployment, err)
+		return nil, err
 	}
-	var buffer bytes.Buffer
 
-	var l int = len(s) / 2
-	for i := l; i > 0; i-- {
-		var startIndex int = (i - 1) * 2
-		buffer.WriteString(s[startIndex : startIndex+2])
+	for k := range *deploy.Properties.Parameters {
+		if k == "masterVMSize" || !strings.HasSuffix(k, "VMSize") {
+			continue
+		}
+
+		poolName := strings.TrimRight(k, "VMSize")
+		spec := &dynamic.NodeGroupSpec{
+			Name:               poolName,
+			MinSize:            1,
+			MaxSize:            -1,
+			SupportScaleToZero: scaleToZeroSupported,
+		}
+		asg, _ := NewAgentPool(spec, m)
+		asgs = append(asgs, asg)
 	}
-	return buffer.String()
+
+	return asgs, nil
 }

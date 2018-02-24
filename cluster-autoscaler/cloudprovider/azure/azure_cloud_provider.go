@@ -1,5 +1,5 @@
 /*
-Copyright 2016 The Kubernetes Authors.
+Copyright 2017 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,45 +17,40 @@ limitations under the License.
 package azure
 
 import (
-	"fmt"
-	"strconv"
 	"strings"
 
+	"github.com/golang/glog"
+
 	apiv1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider"
 	"k8s.io/autoscaler/cluster-autoscaler/utils/errors"
-	"k8s.io/kubernetes/plugin/pkg/scheduler/schedulercache"
+)
+
+const (
+	// ProviderName is the cloud provider name for Azure
+	ProviderName = "azure"
 )
 
 // AzureCloudProvider provides implementation of CloudProvider interface for Azure.
 type AzureCloudProvider struct {
-	azureManager *AzureManager
-	scaleSets    []*ScaleSet
+	azureManager    *AzureManager
+	resourceLimiter *cloudprovider.ResourceLimiter
 }
 
 // BuildAzureCloudProvider creates new AzureCloudProvider
-func BuildAzureCloudProvider(azureManager *AzureManager, specs []string) (*AzureCloudProvider, error) {
+func BuildAzureCloudProvider(azureManager *AzureManager, resourceLimiter *cloudprovider.ResourceLimiter) (cloudprovider.CloudProvider, error) {
 	azure := &AzureCloudProvider{
-		azureManager: azureManager,
-	}
-	for _, spec := range specs {
-		if err := azure.addNodeGroup(spec); err != nil {
-			return nil, err
-		}
+		azureManager:    azureManager,
+		resourceLimiter: resourceLimiter,
 	}
 
 	return azure, nil
 }
 
-// addNodeGroup adds node group defined in string spec. Format:
-// minNodes:maxNodes:scaleSetName
-func (azure *AzureCloudProvider) addNodeGroup(spec string) error {
-	scaleSet, err := buildScaleSet(spec, azure.azureManager)
-	if err != nil {
-		return err
-	}
-	azure.scaleSets = append(azure.scaleSets, scaleSet)
-	azure.azureManager.RegisterScaleSet(scaleSet)
+// Cleanup stops the go routine that is handling the current view of the ASGs in the form of a cache
+func (azure *AzureCloudProvider) Cleanup() error {
+	azure.azureManager.Cleanup()
 	return nil
 }
 
@@ -66,23 +61,23 @@ func (azure *AzureCloudProvider) Name() string {
 
 // NodeGroups returns all node groups configured for this cloud provider.
 func (azure *AzureCloudProvider) NodeGroups() []cloudprovider.NodeGroup {
-	result := make([]cloudprovider.NodeGroup, 0, len(azure.scaleSets))
-	for _, scaleSet := range azure.scaleSets {
-		result = append(result, scaleSet)
+	asgs := azure.azureManager.getAsgs()
+
+	ngs := make([]cloudprovider.NodeGroup, len(asgs))
+	for i, asg := range asgs {
+		ngs[i] = asg
 	}
-	return result
+	return ngs
 }
 
 // NodeGroupForNode returns the node group for the given node.
 func (azure *AzureCloudProvider) NodeGroupForNode(node *apiv1.Node) (cloudprovider.NodeGroup, error) {
-	fmt.Printf("Searching for node group for the node: %s, %s\n", node.Spec.ExternalID, node.Spec.ProviderID)
-	ref := &AzureRef{
-		Name: node.Spec.ProviderID,
+	glog.V(6).Infof("Searching for node group for the node: %s, %s\n", node.Spec.ExternalID, node.Spec.ProviderID)
+	ref := &azureRef{
+		Name: strings.ToLower(node.Spec.ProviderID),
 	}
 
-	scaleSet, err := azure.azureManager.GetScaleSetForInstance(ref)
-
-	return scaleSet, err
+	return azure.azureManager.GetAsgForInstance(ref)
 }
 
 // Pricing returns pricing model for this cloud provider or error if not available.
@@ -90,194 +85,34 @@ func (azure *AzureCloudProvider) Pricing() (cloudprovider.PricingModel, errors.A
 	return nil, cloudprovider.ErrNotImplemented
 }
 
-// AzureRef contains a reference to some entity in Azure world.
-type AzureRef struct {
+// GetAvailableMachineTypes get all machine types that can be requested from the cloud provider.
+func (azure *AzureCloudProvider) GetAvailableMachineTypes() ([]string, error) {
+	return []string{}, nil
+}
+
+// NewNodeGroup builds a theoretical node group based on the node definition provided. The node group is not automatically
+// created on the cloud provider side. The node group is not returned by NodeGroups() until it is created.
+func (azure *AzureCloudProvider) NewNodeGroup(machineType string, labels map[string]string, systemLabels map[string]string, extraResources map[string]resource.Quantity) (cloudprovider.NodeGroup, error) {
+	return nil, cloudprovider.ErrNotImplemented
+}
+
+// GetResourceLimiter returns struct containing limits (max, min) for resources (cores, memory etc.).
+func (azure *AzureCloudProvider) GetResourceLimiter() (*cloudprovider.ResourceLimiter, error) {
+	return azure.resourceLimiter, nil
+}
+
+// Refresh is called before every main loop and can be used to dynamically update cloud provider state.
+// In particular the list of node groups returned by NodeGroups can change as a result of CloudProvider.Refresh().
+func (azure *AzureCloudProvider) Refresh() error {
+	return azure.azureManager.Refresh()
+}
+
+// azureRef contains a reference to some entity in Azure world.
+type azureRef struct {
 	Name string
 }
 
 // GetKey returns key of the given azure reference.
-func (m *AzureRef) GetKey() string {
+func (m *azureRef) GetKey() string {
 	return m.Name
-}
-
-// AzureRefFromProviderId creates InstanceConfig object from provider id which
-// must be in format: azure:///resourceGroupName/name
-func AzureRefFromProviderId(id string) (*AzureRef, error) {
-	splitted := strings.Split(id[9:], "/")
-	if len(splitted) != 2 {
-		return nil, fmt.Errorf("Wrong id: expected format azure:////<unique-id>, got %v", id)
-	}
-	return &AzureRef{
-		Name: splitted[len(splitted)-1],
-	}, nil
-}
-
-// ScaleSet implements NodeGroup interface.
-type ScaleSet struct {
-	AzureRef
-
-	azureManager *AzureManager
-	minSize      int
-	maxSize      int
-}
-
-// MinSize returns minimum size of the node group.
-func (scaleSet *ScaleSet) MinSize() int {
-	return scaleSet.minSize
-}
-
-// MaxSize returns maximum size of the node group.
-func (scaleSet *ScaleSet) MaxSize() int {
-	return scaleSet.maxSize
-}
-
-// TargetSize returns the current TARGET size of the node group. It is possible that the
-// number is different from the number of nodes registered in Kuberentes.
-func (scaleSet *ScaleSet) TargetSize() (int, error) {
-	size, err := scaleSet.azureManager.GetScaleSetSize(scaleSet)
-	return int(size), err
-}
-
-// IncreaseSize increases Scale Set size
-func (scaleSet *ScaleSet) IncreaseSize(delta int) error {
-	if delta <= 0 {
-		return fmt.Errorf("size increase must be positive")
-	}
-	size, err := scaleSet.azureManager.GetScaleSetSize(scaleSet)
-	if err != nil {
-		return err
-	}
-	if int(size)+delta > scaleSet.MaxSize() {
-		return fmt.Errorf("size increase too large - desired:%d max:%d", int(size)+delta, scaleSet.MaxSize())
-	}
-	return scaleSet.azureManager.SetScaleSetSize(scaleSet, size+int64(delta))
-}
-
-// DecreaseTargetSize decreases the target size of the node group. This function
-// doesn't permit to delete any existing node and can be used only to reduce the
-// request for new nodes that have not been yet fulfilled. Delta should be negative.
-// It is assumed that cloud provider will not delete the existing nodes if the size
-// when there is an option to just decrease the target.
-func (scaleSet *ScaleSet) DecreaseTargetSize(delta int) error {
-	if delta >= 0 {
-		return fmt.Errorf("size decrease size must be negative")
-	}
-	size, err := scaleSet.azureManager.GetScaleSetSize(scaleSet)
-	if err != nil {
-		return err
-	}
-	nodes, err := scaleSet.azureManager.GetScaleSetVms(scaleSet)
-	if err != nil {
-		return err
-	}
-	if int(size)+delta < len(nodes) {
-		return fmt.Errorf("attempt to delete existing nodes targetSize:%d delta:%d existingNodes: %d",
-			size, delta, len(nodes))
-	}
-	return scaleSet.azureManager.SetScaleSetSize(scaleSet, size+int64(delta))
-}
-
-// Belongs returns true if the given node belongs to the NodeGroup.
-func (scaleSet *ScaleSet) Belongs(node *apiv1.Node) (bool, error) {
-	fmt.Printf("Check if node belongs to this scale set: scaleset:%v, node:%v\n", scaleSet, node)
-
-	ref := &AzureRef{
-		Name: node.Spec.ProviderID,
-	}
-
-	targetAsg, err := scaleSet.azureManager.GetScaleSetForInstance(ref)
-	if err != nil {
-		return false, err
-	}
-	if targetAsg == nil {
-		return false, fmt.Errorf("%s doesn't belong to a known scale set", node.Name)
-	}
-	if targetAsg.Id() != scaleSet.Id() {
-		return false, nil
-	}
-	return true, nil
-}
-
-// DeleteNodes deletes the nodes from the group.
-func (scaleSet *ScaleSet) DeleteNodes(nodes []*apiv1.Node) error {
-	fmt.Printf("Delete nodes requested: %v\n", nodes)
-	size, err := scaleSet.azureManager.GetScaleSetSize(scaleSet)
-	if err != nil {
-		return err
-	}
-	if int(size) <= scaleSet.MinSize() {
-		return fmt.Errorf("min size reached, nodes will not be deleted")
-	}
-	refs := make([]*AzureRef, 0, len(nodes))
-	for _, node := range nodes {
-		belongs, err := scaleSet.Belongs(node)
-		if err != nil {
-			return err
-		}
-		if belongs != true {
-			return fmt.Errorf("%s belongs to a different asg than %s", node.Name, scaleSet.Id())
-		}
-		azureRef := &AzureRef{
-			Name: node.Spec.ProviderID,
-		}
-		refs = append(refs, azureRef)
-	}
-	return scaleSet.azureManager.DeleteInstances(refs)
-}
-
-// Id returns ScaleSet id.
-func (scaleSet *ScaleSet) Id() string {
-	return scaleSet.Name
-}
-
-// Debug returns a debug string for the Scale Set.
-func (scaleSet *ScaleSet) Debug() string {
-	return fmt.Sprintf("%s (%d:%d)", scaleSet.Id(), scaleSet.MinSize(), scaleSet.MaxSize())
-}
-
-// TemplateNodeInfo returns a node template for this scale set.
-func (scaleSet *ScaleSet) TemplateNodeInfo() (*schedulercache.NodeInfo, error) {
-	return nil, cloudprovider.ErrNotImplemented
-}
-
-// Create ScaleSet from provided spec.
-// spec is in the following format: min-size:max-size:scale-set-name.
-func buildScaleSet(spec string, azureManager *AzureManager) (*ScaleSet, error) {
-	tokens := strings.SplitN(spec, ":", 3)
-	if len(tokens) != 3 {
-		return nil, fmt.Errorf("wrong nodes configuration: %s", spec)
-	}
-
-	scaleSet := ScaleSet{
-		azureManager: azureManager,
-	}
-	if size, err := strconv.Atoi(tokens[0]); err == nil {
-		if size <= 0 {
-			return nil, fmt.Errorf("min size must be >= 1, got: %d", size)
-		}
-		scaleSet.minSize = size
-	} else {
-		return nil, fmt.Errorf("failed to set min size: %s, expected integer", tokens[0])
-	}
-
-	if size, err := strconv.Atoi(tokens[1]); err == nil {
-		if size < scaleSet.minSize {
-			return nil, fmt.Errorf("max size must be greater or equal to min size")
-		}
-		scaleSet.maxSize = size
-	} else {
-		return nil, fmt.Errorf("failed to set max size: %s, expected integer", tokens[1])
-	}
-
-	if tokens[2] == "" {
-		return nil, fmt.Errorf("scale set name must not be blank, got spec: %s", spec)
-	}
-
-	scaleSet.Name = tokens[2]
-	return &scaleSet, nil
-}
-
-// Nodes returns a list of all nodes that belong to this node group.
-func (scaleSet *ScaleSet) Nodes() ([]string, error) {
-	return scaleSet.azureManager.GetScaleSetVms(scaleSet)
 }

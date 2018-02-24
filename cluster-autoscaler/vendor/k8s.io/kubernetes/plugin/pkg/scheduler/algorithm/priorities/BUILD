@@ -1,7 +1,5 @@
 package(default_visibility = ["//visibility:public"])
 
-licenses(["notice"])
-
 load(
     "@io_bazel_rules_go//go:def.bzl",
     "go_library",
@@ -20,13 +18,14 @@ go_library(
         "node_affinity.go",
         "node_label.go",
         "node_prefer_avoid_pods.go",
+        "reduce.go",
         "selector_spreading.go",
         "taint_toleration.go",
         "test_util.go",
     ],
-    tags = ["automanaged"],
+    importpath = "k8s.io/kubernetes/plugin/pkg/scheduler/algorithm/priorities",
     deps = [
-        "//pkg/api/v1/helper:go_default_library",
+        "//pkg/apis/core/v1/helper:go_default_library",
         "//pkg/kubelet/apis:go_default_library",
         "//pkg/util/node:go_default_library",
         "//plugin/pkg/scheduler/algorithm:go_default_library",
@@ -58,8 +57,8 @@ go_test(
         "selector_spreading_test.go",
         "taint_toleration_test.go",
     ],
+    importpath = "k8s.io/kubernetes/plugin/pkg/scheduler/algorithm/priorities",
     library = ":go_default_library",
-    tags = ["automanaged"],
     deps = [
         "//pkg/kubelet/apis:go_default_library",
         "//plugin/pkg/scheduler/algorithm/priorities/util:go_default_library",

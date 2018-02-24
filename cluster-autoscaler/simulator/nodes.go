@@ -25,7 +25,7 @@ import (
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/autoscaler/cluster-autoscaler/utils/drain"
 	"k8s.io/autoscaler/cluster-autoscaler/utils/errors"
-	kube_client "k8s.io/kubernetes/pkg/client/clientset_generated/clientset"
+	kube_client "k8s.io/client-go/kubernetes"
 	"k8s.io/kubernetes/plugin/pkg/scheduler/schedulercache"
 )
 
@@ -35,7 +35,7 @@ import (
 func GetRequiredPodsForNode(nodename string, client kube_client.Interface) ([]*apiv1.Pod, errors.AutoscalerError) {
 
 	// TODO: we should change this to use informer
-	podListResult, err := client.Core().Pods(apiv1.NamespaceAll).List(
+	podListResult, err := client.CoreV1().Pods(apiv1.NamespaceAll).List(
 		metav1.ListOptions{FieldSelector: fields.SelectorFromSet(fields.Set{"spec.nodeName": nodename}).String()})
 	if err != nil {
 		return []*apiv1.Pod{}, errors.ToAutoscalerError(errors.ApiCallError, err)

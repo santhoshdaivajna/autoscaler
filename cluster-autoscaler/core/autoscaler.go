@@ -19,14 +19,13 @@ package core
 import (
 	"time"
 
-	"github.com/golang/glog"
 	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider"
 	"k8s.io/autoscaler/cluster-autoscaler/config/dynamic"
 	"k8s.io/autoscaler/cluster-autoscaler/simulator"
 	"k8s.io/autoscaler/cluster-autoscaler/utils/errors"
 	kube_util "k8s.io/autoscaler/cluster-autoscaler/utils/kubernetes"
+	kube_client "k8s.io/client-go/kubernetes"
 	kube_record "k8s.io/client-go/tools/record"
-	kube_client "k8s.io/kubernetes/pkg/client/clientset_generated/clientset"
 )
 
 // AutoscalerOptions is the whole set of options for configuring an autoscaler
@@ -54,14 +53,8 @@ func NewAutoscaler(opts AutoscalerOptions, predicateChecker *simulator.Predicate
 
 	autoscalerBuilder := NewAutoscalerBuilder(opts.AutoscalingOptions, predicateChecker, kubeClient, kubeEventRecorder, listerRegistry)
 	if opts.ConfigMapName != "" {
-		if opts.NodeGroupAutoDiscovery != "" {
-			glog.Warning("Both --configmap and --node-group-auto-discovery were specified but only the former is going to take effect")
-		}
 		configFetcher := dynamic.NewConfigFetcher(opts.ConfigFetcherOptions, kubeClient, kubeEventRecorder)
 		return NewDynamicAutoscaler(autoscalerBuilder, configFetcher)
-	}
-	if opts.NodeGroupAutoDiscovery != "" {
-		return NewPollingAutoscaler(autoscalerBuilder)
 	}
 	return autoscalerBuilder.Build()
 }

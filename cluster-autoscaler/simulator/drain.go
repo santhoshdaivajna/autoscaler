@@ -25,14 +25,14 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/autoscaler/cluster-autoscaler/utils/drain"
-	client "k8s.io/kubernetes/pkg/client/clientset_generated/clientset"
+	client "k8s.io/client-go/kubernetes"
 	"k8s.io/kubernetes/plugin/pkg/scheduler/schedulercache"
 )
 
 // FastGetPodsToMove returns a list of pods that should be moved elsewhere if the node
 // is drained. Raises error if there is an unreplicated pod.
 // Based on kubectl drain code. It makes an assumption that RC, DS, Jobs and RS were deleted
-// along with their pods (no abandoned pods with dangling created-by annotation). Usefull for fast
+// along with their pods (no abandoned pods with dangling created-by annotation). Useful for fast
 // checks.
 func FastGetPodsToMove(nodeInfo *schedulercache.NodeInfo, skipNodesWithSystemPods bool, skipNodesWithLocalStorage bool,
 	pdbs []*policyv1.PodDisruptionBudget) ([]*apiv1.Pod, error) {

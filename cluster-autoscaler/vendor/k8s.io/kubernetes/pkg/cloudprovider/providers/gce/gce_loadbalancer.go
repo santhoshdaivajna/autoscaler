@@ -21,7 +21,6 @@ import (
 	"fmt"
 	"net"
 	"strings"
-	"time"
 
 	"github.com/golang/glog"
 
@@ -40,10 +39,7 @@ var (
 )
 
 func newLoadBalancerMetricContext(request, region string) *metricContext {
-	return &metricContext{
-		start:      time.Now(),
-		attributes: []string{"loadbalancer_" + request, region, unusedMetricLabel},
-	}
+	return newGenericMetricContext("loadbalancer", request, region, unusedMetricLabel, computeV1Version)
 }
 
 type lbScheme string
@@ -61,7 +57,7 @@ func init() {
 		panic("Incorrect default GCE L7 source ranges")
 	}
 
-	flag.Var(&lbSrcRngsFlag, "cloud-provider-gce-lb-src-cidrs", "CIDRS opened in GCE firewall for LB traffic proxy & health checks")
+	flag.Var(&lbSrcRngsFlag, "cloud-provider-gce-lb-src-cidrs", "CIDRs opened in GCE firewall for LB traffic proxy & health checks")
 }
 
 // String is the method to format the flag's value, part of the flag.Value interface.
@@ -76,7 +72,7 @@ func (c *cidrs) Set(value string) error {
 		c.isSet = true
 		c.ipn = make(netsets.IPNet)
 	} else {
-		return fmt.Errorf("GCE LB CIDRS have already been set")
+		return fmt.Errorf("GCE LB CIDRs have already been set")
 	}
 
 	for _, cidr := range strings.Split(value, ",") {
@@ -141,6 +137,9 @@ func (gce *GCECloud) EnsureLoadBalancer(clusterName string, svc *v1.Service, nod
 			if err != nil {
 				return nil, err
 			}
+
+			// Assume the ensureDeleted function successfully deleted the forwarding rule.
+			existingFwdRule = nil
 		}
 	}
 

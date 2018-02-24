@@ -19,6 +19,8 @@ there is a big chance that it won't work as expected.
 
 | Kubernetes Version  | CA Version   |
 |--------|--------|
+| 1.9.X  | 1.1.X  |
+| 1.8.X  | 1.0.X  |
 | 1.7.X  | 0.6.X  |
 | 1.6.X  | 0.5.X, 0.6.X<sup>*</sup>  |
 | 1.5.X  | 0.4.X  |
@@ -27,6 +29,44 @@ there is a big chance that it won't work as expected.
 <sup>*</sup>Cluster Autoscaler 0.5.X is the official version shipped with k8s 1.6. We've done some basic tests using k8s 1.6 / CA 0.6 and we're not aware of any problems with this setup. However, CA internally simulates k8s scheduler and using different versions of scheduler code can lead to subtle issues.
 
 # Notable changes
+
+CA version 1.1.1:
+* Fixes around metrics in the multi-master configuration.
+* Fixes for unready nodes issues when quota is overrun. 
+
+CA version 1.1.0:
+* Added [Azure support](https://github.com/kubernetes/autoscaler/blob/master/cluster-autoscaler/cloudprovider/azure/README.md).
+* Added support for pod priorities. More details [here](https://github.com/kubernetes/autoscaler/blob/master/cluster-autoscaler/FAQ.md#how-does-cluster-autoscaler-work-with-pod-priority-and-preemption). 
+
+CA version 1.0.3:
+* Adds support for safe-to-evict annotation on pod. Pods with this annotation
+  can be evicted even if they don't meet other requirements for it.
+* Fixes an issue when too many nodes with GPUs could be added during scale-up
+    (https://github.com/kubernetes/kubernetes/issues/54959).
+
+CA Version 1.0.2:
+* Fixes issues with scaling node groups using GPU from 0 to 1 on GKE (https://github.com/kubernetes/autoscaler/pull/401) and AWS (https://github.com/kubernetes/autoscaler/issues/321).
+* Fixes a bug where goroutines performing API calls were leaking when using dynamic config on AWS (https://github.com/kubernetes/autoscaler/issues/252).
+* Node Autoprovisioning support for GKE (the implementation was included in 1.0.0, but this release includes some bugfixes and introduces metrics and events).
+
+CA Version 1.0.1:
+* Fixes a bug in handling nodes that, at the same time, fail to register in Kubernetes and can't be deleted from cloud provider (https://github.com/kubernetes/autoscaler/issues/369).
+* Improves estimation of resources available on a node when performing scale-from-0 on GCE (https://github.com/kubernetes/autoscaler/issues/326).
+* Bugfixes in the new GKE cloud provider implementation.
+
+CA Version 1.0:
+
+With this release we graduated Cluster Autoscaler to GA.
+
+* Support for 1000 nodes running 30 pods each. See: [Scalability testing  report](https://github.com/kubernetes/autoscaler/blob/master/cluster-autoscaler/proposals/scalability_tests.md)
+* Support for 10 min graceful termination.
+* Improved eventing and monitoring.
+* Node allocatable support.
+* Removed Azure support. See: [PR removing support with reasoning behind this decision](https://github.com/kubernetes/autoscaler/pull/229)
+* cluster-autoscaler.kubernetes.io/scale-down-disabled` annotation for marking
+  nodes that should not be scaled down.
+* scale-down-delay-after-delete` and `scale-down-delay-after-failure` flags
+    replaced `scale-down-trial-interval`
 
 CA Version 0.6:
 * Allows scaling node groups to 0 (currently only in GCE/GKE, other cloud providers are coming). See: [How can I scale a node group to 0?](FAQ.md#how-can-i-scale-a-node-group-to-0)
@@ -81,7 +121,4 @@ Right now it is possible to run Cluster Autoscaler on:
 * GCE https://kubernetes.io/docs/concepts/cluster-administration/cluster-management/
 * GKE https://cloud.google.com/container-engine/docs/cluster-autoscaler
 * AWS https://github.com/kubernetes/autoscaler/blob/master/cluster-autoscaler/cloudprovider/aws/README.md
-* Azure
-
-
-
+* Azure https://github.com/kubernetes/autoscaler/blob/master/cluster-autoscaler/cloudprovider/azure/README.md
